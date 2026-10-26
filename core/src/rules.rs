@@ -225,8 +225,45 @@ pub struct PolicySet {
     pub rules: Vec<Rule>,
 }
 
-fn default_action() -> Action {
+    fn default_action() -> Action {
     Action::Plaintext
+}
+
+impl PolicySet {
+    /// 内置默认规则集（服务端首次启动落库；Office/PDF/CAD 加密，其余放行）。
+    ///
+    /// 放在 core 保证双端引用同一份定义（服务端落库、客户端只执行）。
+    pub fn builtin_default() -> Self {
+        Self {
+            id: "default".to_string(),
+            name: "默认规则集（Office/PDF/CAD）".to_string(),
+            version: 1,
+            key_version: 1,
+            default_action: Action::Plaintext,
+            exclude_paths: Vec::new(),
+            rules: vec![Rule {
+                id: "office-pdf-cad".to_string(),
+                priority: 100,
+                action: Action::Encrypt,
+                extensions: vec![
+                    "docx".into(),
+                    "doc".into(),
+                    "xlsx".into(),
+                    "xls".into(),
+                    "pptx".into(),
+                    "ppt".into(),
+                    "pdf".into(),
+                    "dwg".into(),
+                    "dxf".into(),
+                ],
+                name_patterns: Vec::new(),
+                path_prefixes: Vec::new(),
+                process_names: Vec::new(),
+                min_size: None,
+                max_size: None,
+            }],
+        }
+    }
 }
 
 /// 判定输入（服务端"规则预览"与客户端"实际执行"共用）。
@@ -314,8 +351,7 @@ impl PolicySet {
     }
 
     /// 保存前校验（服务端调用）：规则 ID 唯一、大小区间合法。
-    pub fn validate(&self) -> Result<()> {
-        if self.id.trim().is_empty() {
+    pub fn validate(&self) -> Result<()> {        if self.id.trim().is_empty() {
             return Err(Error::Rule("规则集 ID 不能为空".into()));
         }
         if self.key_version == 0 {
@@ -344,8 +380,7 @@ impl PolicySet {
 }
 
 /// 规范化路径：统一分隔符、剥离 `\\?\` 长路径前缀、去尾部多余分隔符。
-pub fn normalize_path(raw: &str) -> String {
-    let mut path = raw.trim().replace('/', "\\");
+pub fn normalize_path(raw: &str) -> String {    let mut path = raw.trim().replace('/', "\\");
     if let Some(rest) = path.strip_prefix("\\\\?\\UNC\\") {
         path = format!("\\\\{rest}");
     } else if let Some(rest) = path.strip_prefix("\\\\?\\") {

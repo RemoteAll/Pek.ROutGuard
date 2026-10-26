@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<EntityModel xmlns:xs="http://www.w3.org/2001/XMLSchema-instance" xs:schemaLocation="https://newlifex.com https://newlifex.com/Model202509.xsd" Version="1.0.2026.1026" Document="https://newlifex.com/xcode/model" ModelVersion="2.0.2026.130" xmlns="https://newlifex.com/Model202509.xsd">
+  <Option>
+    <BaseClass>EntityBase</BaseClass>
+    <Namespace>Pek.ROutGuard.Entity</Namespace>
+    <Output>.\Entity\</Output>
+    <ConnName>OutGuard</ConnName>
+    <NameFormat>Default</NameFormat>
+    <ChineseFileName>False</ChineseFileName>
+    <Nullable>True</Nullable>
+    <HasIModel>False</HasIModel>
+  </Option>
+  <Tables>
+    <Table Name="OgClient" TableName="Og_Client" Description="终端台账（MachineId 唯一；心跳只更新变化项）" MaxCacheCount="0">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Description="编号" />
+        <Column Name="ClientId" DataType="String" Length="50" Master="True" Nullable="False" Description="终端 ID（服务端生成）" />
+        <Column Name="MachineId" DataType="String" Length="64" Master="True" Nullable="False" Description="设备唯一码（SMBIOS+Guid+卷序列号哈希）" />
+        <Column Name="Host" DataType="String" Length="100" Description="主机名" />
+        <Column Name="Os" DataType="String" Length="100" Description="操作系统" />
+        <Column Name="OsBuild" DataType="String" Length="50" Description="系统构建号" />
+        <Column Name="Cpu" DataType="String" Length="100" Description="CPU 型号" />
+        <Column Name="MemoryMb" DataType="Int64" Description="内存（MB）" />
+        <Column Name="DiskTotalGb" DataType="Int64" Description="磁盘总容量（GB）" />
+        <Column Name="Domain" DataType="String" Length="100" Description="域/工作组" />
+        <Column Name="Ip" DataType="String" Length="64" Description="内网 IP" />
+        <Column Name="Mac" DataType="String" Length="64" Description="MAC 地址" />
+        <Column Name="LoggedUser" DataType="String" Length="64" Description="当前登录用户" />
+        <Column Name="ClientVersion" DataType="String" Length="32" Description="客户端版本" />
+        <Column Name="PolicyVersion" DataType="Int32" Description="已生效策略版本" />
+        <Column Name="Status" DataType="String" Length="20" Description="状态：pending/active/rejected/disabled" />
+        <Column Name="DeptId" DataType="Int32" Description="所属部门（0=未分配）" />
+        <Column Name="PubKey" DataType="String" Length="200" Description="设备公钥（Ed25519 base64）" />
+        <Column Name="TokenHash" DataType="String" Length="128" Description="客户端令牌 SHA-256（不存明文）" />
+        <Column Name="InstalledAt" DataType="DateTime" Description="安装时间" />
+        <Column Name="LastSeen" DataType="DateTime" Description="最后心跳" />
+        <Column Name="CreateTime" DataType="DateTime" Description="创建时间" />
+        <Column Name="UpdateTime" DataType="DateTime" Description="更新时间" />
+      </Columns>
+    </Table>
+    <Table Name="OgPolicySet" TableName="Og_Policy_Set" Description="规则集（规则以 JSON 存储；可绑定多个终端组）" MaxCacheCount="0">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Description="编号" />
+        <Column Name="PolicyId" DataType="String" Length="50" Master="True" Nullable="False" Description="规则集 ID" />
+        <Column Name="Name" DataType="String" Length="100" Nullable="False" Description="名称" />
+        <Column Name="Version" DataType="Int32" Nullable="False" Description="版本（每次改规则自增）" />
+        <Column Name="KeyVersion" DataType="Int32" Nullable="False" Description="策略密钥版本" />
+        <Column Name="DefaultAction" DataType="String" Length="20" Description="默认动作 encrypt/plaintext/block_write/audit" />
+        <Column Name="ExcludePaths" DataType="Text" Description="排除路径（JSON 数组）" />
+        <Column Name="RulesJson" DataType="Text" Description="规则明细（JSON 数组）" />
+        <Column Name="Enabled" DataType="Boolean" Nullable="False" Description="是否启用" />
+        <Column Name="Remark" DataType="String" Length="200" Description="备注" />
+        <Column Name="CreateTime" DataType="DateTime" Description="创建时间" />
+        <Column Name="UpdateTime" DataType="DateTime" Description="更新时间" />
+      </Columns>
+    </Table>
+    <Table Name="OgClientEvent" TableName="Og_Client_Event" Description="终端审计事件（只插不改）" InsertOnly="True" MaxCacheCount="0">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Description="编号" />
+        <Column Name="EventId" DataType="String" Length="64" Master="True" Nullable="False" Description="客户端事件 ID（去重）" />
+        <Column Name="ClientId" DataType="String" Length="50" Description="终端 ID" />
+        <Column Name="EventType" DataType="String" Length="30" Description="事件类型" />
+        <Column Name="OccurredAt" DataType="DateTime" Description="发生时间" />
+        <Column Name="ReceivedAt" DataType="DateTime" Description="接收时间" />
+        <Column Name="Path" DataType="String" Length="500" Description="文件路径" />
+        <Column Name="RuleId" DataType="String" Length="50" Description="命中的规则" />
+        <Column Name="UserName" DataType="String" Length="64" Description="终端登录用户" />
+        <Column Name="ProcessName" DataType="String" Length="100" Description="相关进程" />
+        <Column Name="Size" DataType="Int64" Description="文件大小" />
+        <Column Name="Detail" DataType="Text" Description="补充说明（已脱敏）" />
+      </Columns>
+    </Table>
+    <Table Name="OgSetting" TableName="Og_Setting" Description="键值设置">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Description="编号" />
+        <Column Name="Name" DataType="String" Length="100" Master="True" Nullable="False" Description="键" />
+        <Column Name="Value" DataType="Text" Description="值" />
+        <Column Name="UpdateTime" DataType="DateTime" Description="更新时间" />
+      </Columns>
+    </Table>
+  </Tables>
+</EntityModel>

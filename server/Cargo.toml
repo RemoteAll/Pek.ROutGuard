@@ -7,5 +7,14 @@ license.workspace = true
 description = "Pek.ROutGuard 管理端：终端准入 / 规则集与策略下发 / 密钥托管 / 审计 / 外发审批 / Web 面板"
 
 [dependencies]
+# 双端共享：容器格式、规则引擎、协议模型、密钥派生
 pek-outguard-core = { path = "../core" }
-dhrust = { workspace = true }
+# HTTP 服务/路由/静态资源 + 面板鉴权 + TOML 配置管线 + 日志门面桥接（net::panel 使用 log 宏）
+dhrust = { path = "../../DH.RustBase", features = ["net", "toml", "log-bridge"] }
+# ORM（SQLite 内嵌；仅数据库能力，不携带驱动包）
+pek-rcode = { path = "../../Pek.RCode", default-features = false, features = ["database"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# 时间（数据库 DateTime 列与事件时间戳）
+chrono = "0.4"
+base64 = { workspace = true }

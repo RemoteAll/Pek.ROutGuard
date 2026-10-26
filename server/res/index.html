@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pek.ROutGuard 管理端</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #171e26; --line: #26313d; --text: #d7e0ea;
+    --muted: #8b9bb0; --accent: #2f81f7; --ok: #2ea043; --warn: #d29922; --err: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px;
+    background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  header .badge { color: var(--muted); font-size: 12px; }
+  nav { display: flex; gap: 8px; padding: 12px 20px 0; }
+  nav button { border: 1px solid var(--line); background: transparent; color: var(--muted);
+    padding: 6px 14px; border-radius: 6px; cursor: pointer; }
+  nav button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  main { padding: 16px 20px 40px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+  .card .label { color: var(--muted); font-size: 12px; }
+  .card .value { font-size: 24px; font-weight: 600; margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line);
+    font-size: 13px; vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; background: #1b232c; }
+  tr:last-child td { border-bottom: none; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .pill.active { background: rgba(46,160,67,.15); color: var(--ok); }
+  .pill.pending { background: rgba(210,153,34,.15); color: var(--warn); }
+  .pill.disabled, .pill.rejected { background: rgba(248,81,73,.15); color: var(--err); }
+  button.act { background: transparent; border: 1px solid var(--line); color: var(--text);
+    padding: 3px 10px; border-radius: 6px; cursor: pointer; margin-right: 6px; font-size: 12px; }
+  button.act:hover { border-color: var(--accent); }
+  textarea { width: 100%; min-height: 220px; background: #0b1016; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 10px;
+    font-family: Consolas, monospace; font-size: 12px; }
+  input[type=text], input[type=password] { background: #0b1016; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; width: 100%; }
+  .row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+  .row label { color: var(--muted); font-size: 12px; min-width: 64px; }
+  .row .grow { flex: 1; min-width: 200px; }
+  .muted { color: var(--muted); }
+  .err { color: var(--err); }
+  #login { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(8, 12, 16, .92); z-index: 10; }
+  #login .box { width: 340px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 22px; }
+  #login h2 { margin: 0 0 16px; font-size: 16px; }
+  #login .field { margin-bottom: 12px; }
+  #login button { width: 100%; padding: 9px; border: none; border-radius: 6px;
+    background: var(--accent); color: #fff; cursor: pointer; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="login">
+  <form class="box" id="loginForm">
+    <h2>Pek.ROutGuard 管理端</h2>
+    <div class="field"><input type="text" id="user" placeholder="用户名" value="admin" autocomplete="username" /></div>
+    <div class="field"><input type="password" id="password" placeholder="密码" autocomplete="current-password" /></div>
+    <button type="submit">登录</button>
+    <p class="muted" id="loginMsg" style="margin:10px 0 0;font-size:12px;">
+      首次启动默认 admin/admin，请登录后尽快改密。
+    </p>
+  </form>
+</div>
+
+<header>
+  <h1>Pek.ROutGuard</h1>
+  <span class="badge" id="headInfo">加载中…</span>
+  <span style="flex:1"></span>
+  <button class="act" id="logoutBtn">退出</button>
+</header>
+
+<nav>
+  <button data-tab="overview" class="active">概览</button>
+  <button data-tab="clients">终端</button>
+  <button data-tab="policies">规则集</button>
+  <button data-tab="events">审计事件</button>
+</nav>
+
+<main>
+  <section id="tab-overview">
+    <div class="cards" id="statCards"></div>
+    <p class="muted" style="margin-top:14px">
+      提示：客户端注册后需在「终端」页准入（或把 <code>AutoApprove</code> 设为 true）。
+    </p>
+  </section>
+
+  <section id="tab-clients" class="hidden">
+    <div class="row">
+      <button class="act" id="reloadClients">刷新</button>
+      <span class="muted" id="clientsHint"></span>
+    </div>
+    <table id="clientTable">
+      <thead><tr>
+        <th>主机 / 用户</th><th>机器码</th><th>配置</th><th>状态</th><th>策略</th><th>最后心跳</th><th>操作</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section id="tab-policies" class="hidden">
+    <div class="row">
+      <label>规则集 ID</label>
+      <input type="text" id="policyId" class="grow" value="default" />
+      <label>名称</label>
+      <input type="text" id="policyName" class="grow" value="默认规则集" />
+    </div>
+    <div class="row">
+      <label>默认动作</label>
+      <select id="policyDefault" style="background:#0b1016;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:7px">
+        <option value="plaintext">放行（plaintext）</option>
+        <option value="encrypt">加密（encrypt）</option>
+        <option value="audit">仅审计（audit）</option>
+        <option value="block_write">禁止落盘（block_write）</option>
+      </select>
+      <label style="min-width:auto"><input type="checkbox" id="policyEnabled" checked /> 启用</label>
+      <span style="flex:1"></span>
+      <button class="act" id="loadPolicy">读取现有</button>
+      <button class="act" id="savePolicy">保存（自动升版本）</button>
+    </div>
+    <div class="row">
+      <label>规则 JSON</label>
+      <span class="muted">数组；字段：id/priority/action/extensions/namePatterns/pathPrefixes/processNames/minSize/maxSize</span>
+    </div>
+    <textarea id="policyRules" spellcheck="false"></textarea>
+    <div class="row" style="margin-top:10px">
+      <label>排除路径</label>
+      <input type="text" id="policyExclude" class="grow" placeholder="多个用分号分隔，如 C:\ProgramData\Pek\OutGuard\temp;D:\Work\temp" />
+    </div>
+    <p class="muted" id="policyMsg"></p>
+  </section>
+
+  <section id="tab-events" class="hidden">
+    <div class="row">
+      <button class="act" id="reloadEvents">刷新</button>
+      <span class="muted" id="eventsHint"></span>
+    </div>
+    <table id="eventTable">
+      <thead><tr>
+        <th>时间</th><th>终端</th><th>类型</th><th>用户</th><th>路径</th><th>规则</th><th>说明</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const state = { token: localStorage.getItem('og_token') || '', tab: 'overview', timer: null };
+
+const $ = (id) => document.getElementById(id);
+
+async function api(path, options = {}) {
+  const headers = Object.assign({ 'Content-Type': 'application/json' }, options.headers || {});
+  if (state.token) headers['Authorization'] = 'Bearer ' + state.token;
+  const response = await fetch(path, Object.assign({}, options, { headers }));
+  const text = await response.text();
+  let body = {};
+  try { body = text ? JSON.parse(text) : {}; } catch (_) { body = { message: text }; }
+  if (response.status === 401) { showLogin(); throw new Error('需要登录'); }
+  if (!response.ok || body.ok === false) {
+    throw new Error(body.message || body.error || ('HTTP ' + response.status));
+  }
+  return body.data !== undefined ? body.data : body;
+}
+
+function showLogin() {
+  $('login').classList.remove('hidden');
+  state.token = '';
+  localStorage.removeItem('og_token');
+}
+
+function showApp() { $('login').classList.add('hidden'); }
+
+$('loginForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  $('loginMsg').textContent = '登录中…';
+  try {
+    const data = await api('/api/login', {
+      method: 'POST',
+      body: JSON.stringify({ user: $('user').value, password: $('password').value })
+    });
+    state.token = data.token;
+    localStorage.setItem('og_token', data.token);
+    $('loginMsg').textContent = '';
+    showApp();
+    await refreshAll();
+  } catch (e) {
+    $('loginMsg').textContent = '登录失败：' + e.message;
+    $('loginMsg').className = 'err';
+  }
+});
+
+$('logoutBtn').addEventListener('click', async () => {
+  try { await api('/api/logout', { method: 'POST', body: '{}' }); } catch (_) {}
+  showLogin();
+});
+
+document.querySelectorAll('nav button').forEach((button) => {
+  button.addEventListener('click', () => switchTab(button.dataset.tab));
+});
+
+function switchTab(tab) {
+  state.tab = tab;
+  document.querySelectorAll('nav button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  ['overview', 'clients', 'policies', 'events'].forEach((name) => {
+    $('tab-' + name).classList.toggle('hidden', name !== tab);
+  });
+  if (tab === 'overview') loadStatus();
+  if (tab === 'clients') loadClients();
+  if (tab === 'events') loadEvents();
+  if (tab === 'policies') loadPolicy();
+}
+
+async function loadStatus() {
+  try {
+    const data = await api('/api/status');
+    $('headInfo').textContent =
+      'v' + data.version + ' · ' + data.server.companyName +
+      ' · 面板 ' + data.server.webUserName +
+      (data.server.defaultPassword ? '（默认密码，请改密）' : '');
+    const stats = data.stats;
+    const cards = [
+      ['终端总数', stats.clients],
+      ['在线', stats.online],
+      ['待准入', stats.pending],
+      ['规则集', stats.policies],
+      ['审计事件', stats.events],
+      ['运行时长', Math.floor(data.uptimeSecs / 60) + ' 分']
+    ];
+    $('statCards').innerHTML = cards.map(([label, value]) =>
+      '<div class="card"><div class="label">' + label + '</div><div class="value">' + value + '</div></div>'
+    ).join('');
+  } catch (e) { $('headInfo').textContent = '加载失败：' + e.message; }
+}
+
+async function loadClients() {
+  try {
+    const rows = await api('/api/clients?limit=200');
+    $('clientsHint').textContent = '共 ' + rows.length + ' 台（最多显示 200 台）';
+    $('clientTable').querySelector('tbody').innerHTML = rows.map((row) => {
+      const status = row.status || 'pending';
+      const actions = status === 'active'
+        ? '<button class="act" data-client="' + row.clientId + '" data-status="disabled">禁用</button>'
+        : '<button class="act" data-client="' + row.clientId + '" data-status="active">准入</button>' +
+          '<button class="act" data-client="' + row.clientId + '" data-status="rejected">拒绝</button>';
+      return '<tr>' +
+        '<td>' + escapeHtml(row.host) + '<div class="muted">' + escapeHtml(row.loggedUser) + '</div></td>' +
+        '<td><code>' + escapeHtml(row.machineId) + '</code></td>' +
+        '<td>' + escapeHtml(row.os) + '<div class="muted">' + escapeHtml(row.cpu) + ' / ' +
+          row.memoryMb + 'MB / ' + row.diskTotalGb + 'GB</div></td>' +
+        '<td><span class="pill ' + status + '">' + status + '</span></td>' +
+        '<td>' + row.policyVersion + '</td>' +
+        '<td>' + escapeHtml(row.lastSeen) + '</td>' +
+        '<td>' + actions + '</td>' +
+        '</tr>';
+    }).join('') || '<tr><td colspan="7" class="muted">暂无终端</td></tr>';
+
+    $('clientTable').querySelectorAll('button[data-client]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        try {
+          await api('/api/client/status', {
+            method: 'POST',
+            body: JSON.stringify({ clientId: button.dataset.client, status: button.dataset.status })
+          });
+          await loadClients();
+        } catch (e) { alert('操作失败：' + e.message); }
+      });
+    });
+  } catch (e) { $('clientsHint').textContent = '加载失败：' + e.message; }
+}
+
+const DEFAULT_RULES = JSON.stringify([{
+  id: 'office-pdf-cad', priority: 100, action: 'encrypt',
+  extensions: ['docx', 'doc', 'xlsx', 'xls', 'pptx', 'ppt', 'pdf', 'dwg', 'dxf']
+}], null, 2);
+
+async function loadPolicy() {
+  try {
+    const items = await api('/api/policies');
+    const existing = items.find((item) => item.id === $('policyId').value) || items[0];
+    if (!existing) {
+      $('policyRules').value = DEFAULT_RULES;
+      return;
+    }
+    $('policyId').value = existing.id;
+    $('policyName').value = existing.name;
+    $('policyDefault').value = existing.defaultAction || 'plaintext';
+    $('policyEnabled').checked = !!existing.enabled;
+    $('policyExclude').value = (existing.excludePaths || []).join(';');
+    $('policyRules').value = JSON.stringify(existing.rules || [], null, 2);
+    $('policyMsg').textContent = '已载入 ' + existing.id + ' v' + existing.version;
+  } catch (e) { $('policyMsg').textContent = '加载失败：' + e.message; }
+}
+
+$('loadPolicy').addEventListener('click', loadPolicy);
+
+$('savePolicy').addEventListener('click', async () => {
+  try {
+    const rules = JSON.parse($('policyRules').value || '[]');
+    const excludePaths = $('policyExclude').value.split(';').map((s) => s.trim()).filter(Boolean);
+    const result = await api('/api/policy', {
+      method: 'POST',
+      body: JSON.stringify({
+        id: $('policyId').value.trim(),
+        name: $('policyName').value.trim(),
+        defaultAction: $('policyDefault').value,
+        excludePaths,
+        rules,
+        enabled: $('policyEnabled').checked
+      })
+    });
+    $('policyMsg').textContent = '已保存：' + result.id + ' v' + result.version +
+      '（客户端将在下一次心跳后拉取）';
+  } catch (e) { $('policyMsg').textContent = '保存失败：' + e.message; }
+});
+
+async function loadEvents() {
+  try {
+    const rows = await api('/api/events?limit=100');
+    $('eventsHint').textContent = '最近 ' + rows.length + ' 条';
+    $('eventTable').querySelector('tbody').innerHTML = rows.map((row) =>
+      '<tr>' +
+        '<td>' + escapeHtml(row.receivedAt) + '</td>' +
+        '<td><code>' + escapeHtml(row.clientId) + '</code></td>' +
+        '<td>' + escapeHtml(row.eventType) + '</td>' +
+        '<td>' + escapeHtml(row.user) + '</td>' +
+        '<td>' + escapeHtml(row.path) + '</td>' +
+        '<td>' + escapeHtml(row.ruleId) + '</td>' +
+        '<td>' + escapeHtml(row.detail) + '</td>' +
+      '</tr>'
+    ).join('') || '<tr><td colspan="7" class="muted">暂无事件</td></tr>';
+  } catch (e) { $('eventsHint').textContent = '加载失败：' + e.message; }
+}
+
+$('reloadClients').addEventListener('click', loadClients);
+$('reloadEvents').addEventListener('click', loadEvents);
+
+function escapeHtml(value) {
+  return String(value == null ? '' : value)
+    .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+}
+
+async function refreshAll() {
+  if (state.tab === 'overview') await loadStatus();
+  if (state.tab === 'clients') await loadClients();
+  if (state.tab === 'events') await loadEvents();
+}
+
+// 自动刷新：30 秒一次；后台标签页不轮询（document.hidden 守卫）
+state.timer = setInterval(() => {
+  if (document.hidden) return;
+  refreshAll();
+}, 30000);
+
+(async function boot() {
+  if (!state.token) { showLogin(); return; }
+  showApp();
+  await refreshAll();
+})();
+</script>
+</body>
+</html>

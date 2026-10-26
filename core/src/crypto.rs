@@ -168,6 +168,35 @@ pub fn decrypt_chunk(
         .map_err(|_| Error::Crypto("分块解密失败（密钥不匹配或数据被篡改）".into()))
 }
 
+/// 由客户端令牌派生"策略密钥包裹密钥"（KEK）。
+///
+/// 用途：服务端把 PolicyKey 下发给已注册终端时，用该 KEK 包裹后再传；
+/// 客户端用同一令牌解包。令牌只在注册时经 HTTPS 下发（M2 可升级为 X25519 公钥包裹）。
+pub fn derive_client_wrap_key(client_token: &str) -> Result<[u8; KEY_LEN]> {
+    let token = client_token.trim();
+    if token.is_empty() {
+        return Err(Error::Crypto("客户端令牌为空".into()));
+    }
+    let ikm = sha256(token.as_bytes());
+    let hkdf = Hkdf::<Sha256>::new(Some(b"pek-outguard-client-wrap-v1"), &ikm);
+    let mut okm = [0u8; KEY_LEN];
+    hkdf.expand(b"policy-key", &mut okm)
+        .map_err(|e| Error::Crypto(format!("包裹密钥派生失败：{e:?}")))?;
+    Ok(okm)
+}
+
+/// 服务端：用客户端令牌包裹策略密钥（返回值放入 `WrappedPolicyKey.wrappedKey` 的 base64）。
+pub fn wrap_for_client(client_token: &str, key: &[u8; KEY_LEN]) -> Result<Vec<u8>> {
+    let kek = derive_client_wrap_key(client_token)?;
+    wrap_key(&kek, key, b"outguard-policy-key")
+}
+
+/// 客户端：用客户端令牌解包策略密钥。
+pub fn unwrap_for_client(client_token: &str, packed: &[u8]) -> Result<[u8; KEY_LEN]> {
+    let kek = derive_client_wrap_key(client_token)?;
+    unwrap_key(&kek, packed, b"outguard-policy-key")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +280,21 @@ mod tests {
     #[test]
     fn hex_shape() {
         assert_eq!(hex(&[0x00, 0x0f, 0xff]), "000fff");
+    }
+
+    #[test]
+    fn client_wrap_roundtrip() {
+        let policy_key = derive_policy_key(&master(), "policy-rd", 1).expect("派生成功");
+        let token = "0123456789abcdef0123456789abcdef";
+
+        let packed = wrap_for_client(token, &policy_key).expect("包裹成功");
+        let back = unwrap_for_client(token, &packed).expect("解包成功");
+        assert_eq!(back, policy_key);
+
+        assert!(
+            unwrap_for_client("ffffffffffffffffffffffffffffffff", &packed).is_err(),
+            "换令牌必须解包失败"
+        );
+        assert!(wrap_for_client("  ", &policy_key).is_err());
     }
 }

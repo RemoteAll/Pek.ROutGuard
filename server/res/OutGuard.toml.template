@@ -1,0 +1,30 @@
+# Pek.ROutGuard Server 配置（首次启动自动生成；面板保存会保留注释）
+
+[Server]
+# 监听地址（仅本机调试用 127.0.0.1；要远程访问改 0.0.0.0 或内网 IP）
+Host = "127.0.0.1"
+# 面板与客户端接口端口
+Port = 5600
+# 是否允许非回环来源（改为 true 前请先改面板密码，并确认已启用 HTTPS 或内网隔离）
+AllowRemote = false
+# 面板账号（首次启动若密码哈希为空，自动初始化为 admin/admin 并提示改密）
+WebUserName = "admin"
+# 密码哈希（盐:哈希，由面板修改时写入）
+WebPasswordHash = ""
+# 鉴权级别：None / LocalOnly（默认：仅本机免登录）/ Full（任何来源都要登录）
+WebAuthLevel = "LocalOnly"
+
+# 加密容器明文头里的公司信息（未装客户端也能看到）
+CompanyName = "示例科技有限公司"
+Notice = "本文件已加密，仅限安装 OutGuard 客户端的授权电脑打开。如需外发请联系信息安全部门。"
+# 规则集未配置时的密级默认值
+Classification = "内部"
+
+# 终端注册是否自动批准（true = 内网试用；生产建议 false，由管理员在面板准入）
+AutoApprove = false
+# 监控根路径（规则集可覆盖；客户端只监控这些路径，避免全盘劳作）
+WatchRoots = []
+# 客户端必须排除的目录（受控临时目录等）
+ExcludePaths = []
+# 离线宽限天数（0 = 不限制；超期后按策略禁止打开）
+OfflineGraceDays = 7
