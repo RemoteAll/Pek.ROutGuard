@@ -24,6 +24,27 @@ pub enum ClientStatus {
     Disabled,
 }
 
+/// 终端硬件/系统基础信息（资产台账用；不含任何凭据）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HardwareInfo {
+    /// CPU 型号（如 `Intel Core i7-13700`）。
+    #[serde(default)]
+    pub cpu: String,
+    /// 内存（MB）。
+    #[serde(default)]
+    pub memory_mb: u64,
+    /// 磁盘总容量（GB）。
+    #[serde(default)]
+    pub disk_total_gb: u64,
+    /// 系统构建号（如 `22631.4317`）。
+    #[serde(default)]
+    pub os_build: String,
+    /// 域 / 工作组。
+    #[serde(default)]
+    pub domain: String,
+}
+
 /// 注册请求（安装后首次启动自动调用）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +62,21 @@ pub struct RegisterRequest {
     /// 注册码（服务端开启"注册码准入"时必填）。
     #[serde(default)]
     pub enroll_code: String,
+    /// 硬件基础信息（资产台账）。
+    #[serde(default)]
+    pub hardware: Option<HardwareInfo>,
+    /// 当前登录用户（Windows 用户名）。
+    #[serde(default)]
+    pub logged_user: String,
+    /// 内网 IP（资产识别，非鉴权）。
+    #[serde(default)]
+    pub ip: String,
+    /// MAC 地址。
+    #[serde(default)]
+    pub mac: String,
+    /// 客户端安装时间（unix 秒）。
+    #[serde(default)]
+    pub installed_at: i64,
 }
 
 /// 注册响应。
@@ -96,6 +132,15 @@ pub struct HeartbeatRequest {
     /// 自上次心跳以来新增的异常计数（篡改/拒绝打开/卸载尝试）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anomalies: Option<u32>,
+    /// 内网 IP（变化才发）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+    /// MAC 地址（变化才发）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+    /// 硬件/系统信息（变化才发）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<HardwareInfo>,
 }
 
 /// 服务端指令。
@@ -357,10 +402,55 @@ mod tests {
             os: None,
             health: None,
             anomalies: None,
+            ip: None,
+            mac: None,
+            hardware: None,
         };
         let json = serde_json::to_string(&request).expect("序列化成功");
         assert!(!json.contains("hostname"), "未变化字段不应出现：{json}");
         assert!(json.contains("policyVersion"));
+    }
+
+    #[test]
+    fn register_request_carries_asset_info() {
+        let request = RegisterRequest {
+            machine_id: "0123456789abcdef0123456789abcdef".into(),
+            hostname: "PC-001".into(),
+            os: "Windows 11 23H2 x64".into(),
+            client_version: "0.1.0".into(),
+            public_key: "AAAA".into(),
+            enroll_code: String::new(),
+            hardware: Some(HardwareInfo {
+                cpu: "Intel Core i7-13700".into(),
+                memory_mb: 32768,
+                disk_total_gb: 1024,
+                os_build: "22631.4317".into(),
+                domain: "CORP".into(),
+            }),
+            logged_user: "zhangsan".into(),
+            ip: "10.0.0.8".into(),
+            mac: "00-11-22-33-44-55".into(),
+            installed_at: 1_800_000_000,
+        };
+
+        let json = serde_json::to_string(&request).expect("序列化成功");
+        let back: RegisterRequest = serde_json::from_str(&json).expect("反序列化成功");
+        assert_eq!(back, request);
+        assert!(json.contains("machineId"));
+        assert!(json.contains("hardware"));
+    }
+
+    #[test]
+    fn register_request_accepts_old_payload() {
+        // 旧客户端只发基础字段也要能解析（升级期兼容）。
+        let json = r#"{
+            "machineId":"abc","hostname":"PC","os":"Windows 10",
+            "clientVersion":"0.0.9","publicKey":"AAAA"
+        }"#;
+        let request: RegisterRequest = serde_json::from_str(json).expect("反序列化成功");
+        assert_eq!(request.hardware, None);
+        assert_eq!(request.logged_user, "");
+        assert_eq!(request.installed_at, 0);
     }
 
     #[test]

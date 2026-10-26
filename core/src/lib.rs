@@ -16,6 +16,7 @@
 pub mod container;
 pub mod crypto;
 pub mod error;
+pub mod machine;
 pub mod protocol;
 pub mod rules;
 pub mod signature;
