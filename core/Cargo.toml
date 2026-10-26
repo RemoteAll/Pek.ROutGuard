@@ -1,0 +1,18 @@
+[package]
+name = "pek-outguard-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Pek.ROutGuard 共享核心：OGD1 加密容器、规则引擎、客户端协议、密钥派生（Server/Client 同一份实现）"
+
+[dependencies]
+# 仅复用基础能力（安全随机 / 通配符匹配 / 文件名清理 / 词法路径规范化）
+dhrust = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+aes-gcm = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }

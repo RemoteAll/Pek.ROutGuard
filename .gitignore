@@ -1,0 +1,13 @@
+/target
+/dist
+*.pdb
+*.ilk
+*.user
+.vs/
+.idea/
+*.bak-*
+# 运行时数据（服务端数据库、主密钥、终端本地缓存）
+/Data/
+# 本地覆盖配置（模板必须入库）
+Config/*.local.toml
+Config/*.local.json

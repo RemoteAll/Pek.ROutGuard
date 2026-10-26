@@ -1,0 +1,11 @@
+[package]
+name = "pek-outguard-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Pek.ROutGuard 管理端：终端准入 / 规则集与策略下发 / 密钥托管 / 审计 / 外发审批 / Web 面板"
+
+[dependencies]
+pek-outguard-core = { path = "../core" }
+dhrust = { workspace = true }

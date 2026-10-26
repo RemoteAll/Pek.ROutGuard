@@ -1,0 +1,6 @@
+# 依赖下载走国内镜像（用户级约定）：replace-with 为透明替换，不影响 Cargo.lock 源地址
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"

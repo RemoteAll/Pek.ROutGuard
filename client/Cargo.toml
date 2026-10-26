@@ -1,0 +1,11 @@
+[package]
+name = "pek-outguard-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Pek.ROutGuard 终端：服务常驻 / 文件监控 / 自动加密 / 受控打开 / 防退出"
+
+[dependencies]
+pek-outguard-core = { path = "../core" }
+dhrust = { workspace = true }

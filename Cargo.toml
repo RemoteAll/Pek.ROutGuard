@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["core", "server", "client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["PeiKeSmart"]
+license = "MIT"
+
+[workspace.dependencies]
+# 生态基础库（path 依赖；编译报缺 API 时先拉新../DH.RustBase 等仓库）
+dhrust = { path = "../DH.RustBase" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 加密原语（与 dhrust::secret 同族；容器需要流式分块 + AAD，故直接使用）
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+ed25519-dalek = "2"
+base64 = "0.22"
+
+[profile.release]
+# 与生态其他服务一致：thin LTO + strip；交付物由打包脚本产出
+lto = "thin"
+strip = true
+incremental = true
+
+# 本地快速构建（继承 release，关闭 LTO、提高并行）：cargo build --profile fast
+# 只用于日常调测，不作为交付物
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
