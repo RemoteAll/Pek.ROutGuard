@@ -291,6 +291,9 @@ pub fn build_policy_bundle(app: &App, client_token: &str) -> Result<PolicyBundle
         watch_roots: server.watch_roots.clone(),
         exclude_paths,
         container_ext: pek_outguard_core::CONTAINER_EXT.to_string(),
+        company: server.company_name.clone(),
+        notice: server.notice.clone(),
+        classification: server.classification.clone(),
         server_time: now_secs(),
     })
 }

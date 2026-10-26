@@ -42,6 +42,8 @@ fn register_request() -> RegisterRequest {
         ip: "10.0.0.8".into(),
         mac: "00-11-22-33-44-55".into(),
         installed_at: 1_800_000_000,
+        account: String::new(),
+        password: String::new(),
     }
 }
 

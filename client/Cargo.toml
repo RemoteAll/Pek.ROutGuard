@@ -7,5 +7,13 @@ license.workspace = true
 description = "Pek.ROutGuard 终端：服务常驻 / 文件监控 / 自动加密 / 受控打开 / 防退出"
 
 [dependencies]
+# 双端共享：容器格式、规则引擎、协议模型、密钥派生
 pek-outguard-core = { path = "../core" }
-dhrust = { workspace = true }
+# 阻塞 HTTP（注册/心跳/策略/事件）+ TOML 配置 + 凭据可逆加密（enc:v1）
+dhrust = { path = "../../DH.RustBase", features = ["http-client", "toml", "secret"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = "0.4"
+base64 = { workspace = true }
+# 配置写回（TOML 序列化）
+toml = "1"

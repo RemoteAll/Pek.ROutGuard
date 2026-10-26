@@ -77,6 +77,12 @@ pub struct RegisterRequest {
     /// 客户端安装时间（unix 秒）。
     #[serde(default)]
     pub installed_at: i64,
+    /// 员工账号（账号模式；与 password 一起提交，由服务端校验并绑定人员）。
+    #[serde(default)]
+    pub account: String,
+    /// 员工密码（账号模式；仅注册时使用，服务端不存储明文）。
+    #[serde(default)]
+    pub password: String,
 }
 
 /// 注册响应。
@@ -198,6 +204,15 @@ pub struct PolicyBundle {
     pub exclude_paths: Vec<String>,
     /// 容器扩展名（默认 `ogd`）。
     pub container_ext: String,
+    /// 公司名称（写入容器明文头）。
+    #[serde(default)]
+    pub company: String,
+    /// 防泄密提示语（写入容器明文头；未装客户端可见）。
+    #[serde(default)]
+    pub notice: String,
+    /// 默认密级。
+    #[serde(default)]
+    pub classification: String,
     /// 服务端时间（unix 秒）。
     pub server_time: i64,
 }
@@ -431,6 +446,8 @@ mod tests {
             ip: "10.0.0.8".into(),
             mac: "00-11-22-33-44-55".into(),
             installed_at: 1_800_000_000,
+            account: "zhangsan".into(),
+            password: "secret".into(),
         };
 
         let json = serde_json::to_string(&request).expect("序列化成功");
@@ -474,6 +491,9 @@ mod tests {
             watch_roots: vec!["D:\\Work".into()],
             exclude_paths: vec!["C:\\ProgramData\\Pek\\OutGuard\\temp".into()],
             container_ext: "ogd".into(),
+            company: "示例科技有限公司".into(),
+            notice: "本文件已加密".into(),
+            classification: "内部".into(),
             server_time: 1_800_000_000,
         };
 

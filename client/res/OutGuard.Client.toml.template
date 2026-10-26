@@ -1,0 +1,17 @@
+# Pek.ROutGuard Client 配置（首次启动自动生成；命令行 config set 修改）
+
+[Client]
+# 服务端地址（管理端面板 + 客户端接口）
+ServerUrl = "http://127.0.0.1:5600"
+# 注册码（服务端要求时填写；与服务端 Config/OutGuard.toml 的准入策略配合）
+EnrollCode = ""
+# 员工账号（账号模式；留空则按设备自动注册）
+Account = ""
+# 员工密码（账号模式；加密存储，不会明文落盘）
+Password = ""
+# 受控临时目录（解密打开时使用；留空则用系统临时目录下的 OutGuard 子目录）
+TempDir = ""
+# 监控根路径（服务端策略优先；这里仅作为服务端未下发时的兜底）
+WatchRoots = []
+# 审计事件上报间隔（秒）
+ReportIntervalSecs = 30

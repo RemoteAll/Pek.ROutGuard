@@ -1,96 +1,557 @@
-//! Pek.ROutGuard Client（终端）。
+//! Pek.ROutGuard Client CLI。
 //!
-//! 当前为 **M1 骨架**：命令面 + 容器头读取（"已装客户端能看到文件属于哪条规则/哪个公司"）。
-//! 业务实现按 `docs/架构设计.md` 第 7 节推进：服务化 → 注册 → 策略缓存 → 监控 → 加密 → 受控打开。
+//! **定位**：安装后常驻、按服务端策略自动加密；**可配置、不可停止、不可卸载**
+//! （配置入口只改"连哪个服务端、用哪个账号"，不提供暂停保护/退出/卸载；卸载需服务端令牌，M2）。
 //!
 //! 命令：
-//! - `status`：版本与配置路径
-//! - `open <file>`：打开容器（M1 骨架阶段仅显示头部信息；完整解密需策略密钥）
-//! - `help`：帮助
+//! - `status` 查看配置与同步状态
+//! - `config show` / `config set --server URL [--enroll CODE] [--account USER] [--password PASS] [--temp DIR]`
+//! - `register` 注册终端（设备模式或账号模式）
+//! - `sync` 拉取策略与密钥
+//! - `heartbeat` 发送一次心跳
+//! - `encrypt <file>` / `decrypt <file> [--out DIR]` / `open <file>`
+//! - `version` / `help`
+//!
+//! 服务化（Windows 服务、防退出、托盘、文件监控）在 M2 接入。
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use pek_outguard_core::container;
+use dhrust::logs::LogLevel;
+use pek_outguard_client::api::Api;
+use pek_outguard_client::config::{self, ClientConfig};
+use pek_outguard_client::{VERSION, base_dir, ops, state};
+use pek_outguard_core::machine;
+use pek_outguard_core::protocol::{HardwareInfo, HeartbeatRequest, RegisterRequest};
+use pek_outguard_core::signature::DeviceKey;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut iter = args.iter();
-    match iter.next().map(String::as_str) {
-        None | Some("status") => {
-            print_status();
-            ExitCode::SUCCESS
-        }
-        Some("open") => match iter.next() {
-            Some(path) => open_container(path),
-            None => {
-                eprintln!("用法：pek-outguard-client open <容器文件>");
-                ExitCode::from(2)
-            }
-        },
+    let base = base_dir();
+    let _ = std::fs::create_dir_all(&base);
+    dhrust::logs::init_console_and_file(base.join("Log"), false, LogLevel::Info);
+    dhrust::info!("Pek.ROutGuard Client v{VERSION} 执行：args={args:?} 基目录={}", base.display());
+    dhrust::logs::flush();
+
+    let code = match args.first().map(String::as_str) {
+        None | Some("status") => status_command(&base),
+        Some("config") => config_command(&base, args.get(1..).unwrap_or(&[])),
+        Some("register") => register_command(&base),
+        Some("sync") => sync_command(&base),
+        Some("heartbeat") => heartbeat_command(&base),
+        Some("encrypt") => encrypt_command(&base, args.get(1).map(String::as_str)),
+        Some("decrypt") => decrypt_command(&base, args.get(1..).unwrap_or(&[])),
+        Some("open") => open_command(&base, args.get(1).map(String::as_str)),
         Some("version") | Some("--version") | Some("-version") => {
-            println!(
-                "{} {}",
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION")
-            );
-            ExitCode::SUCCESS
+            println!("Pek.ROutGuard Client v{VERSION}");
+            0
         }
         Some("help") | Some("--help") | Some("-h") => {
             print_help();
-            ExitCode::SUCCESS
+            0
         }
         Some(other) => {
-            eprintln!("未知命令：{other}");
-            print_help();
-            ExitCode::from(2)
+            eprintln!("未知命令：{other}（用 help 查看用法）");
+            2
+        }
+    };
+
+    dhrust::logs::flush();
+    ExitCode::from(code)
+}
+
+fn print_help() {
+    println!(
+        "Pek.ROutGuard Client v{VERSION} —— 企业文件防泄漏终端\n\
+         \n\
+         用法：\n\
+         \x20 pek-outguard-client status                 查看配置与同步状态\n\
+         \x20 pek-outguard-client config show            显示当前配置\n\
+         \x20 pek-outguard-client config set --server http://10.0.0.5:5600 \\\n\
+         \x20     [--enroll CODE] [--account USER] [--password PASS] [--temp DIR]\n\
+         \x20 pek-outguard-client register               注册终端（设备模式/账号模式）\n\
+         \x20 pek-outguard-client sync                   拉取策略与密钥\n\
+         \x20 pek-outguard-client heartbeat              发送一次心跳\n\
+         \x20 pek-outguard-client encrypt <file>         按策略加密文件\n\
+         \x20 pek-outguard-client decrypt <file> [--out DIR]  解密到受控目录\n\
+         \x20 pek-outguard-client open <file>            解密并用默认程序打开\n\
+         \x20 pek-outguard-client version / help\n\
+         \n\
+         说明：客户端可配置但**不可停止、不可卸载**；卸载需服务端授权（M2）。"
+    );
+}
+
+// ————— status / config —————
+
+fn status_command(base: &Path) -> u8 {
+    let config = config::load(base);
+    let section = &config.value().client;
+    let state = state::load(base);
+
+    println!("Pek.ROutGuard Client v{VERSION}");
+    println!("基目录：{}", base.display());
+    println!("服务端：{}", section.server_url);
+    println!(
+        "账号：{}",
+        if section.account.trim().is_empty() {
+            "（设备模式）"
+        } else {
+            section.account.as_str()
+        }
+    );
+    println!(
+        "密码：{}",
+        if section.password.is_empty() {
+            "未设置"
+        } else {
+            "已保存（enc:v1 加密）"
+        }
+    );
+    println!(
+        "终端：{}",
+        if state.client_id.is_empty() {
+            "未注册"
+        } else {
+            state.client_id.as_str()
+        }
+    );
+    println!(
+        "状态：{}",
+        if state.status.is_empty() {
+            "-"
+        } else {
+            state.status.as_str()
+        }
+    );
+    println!(
+        "策略版本：{}（最近同步：{}）",
+        state.policy_version,
+        if state.last_sync.is_empty() {
+            "-"
+        } else {
+            state.last_sync.as_str()
+        }
+    );
+    println!("待上报事件：{}", state.pending_events.len());
+    println!("受控临时目录：{}", config::temp_dir(section).display());
+    println!("提示：客户端不可停止、不可卸载；卸载需服务端授权（M2）。");
+    0
+}
+
+fn config_command(base: &Path, args: &[String]) -> u8 {
+    match args.first().map(String::as_str) {
+        Some("show") | None => {
+            let config = config::load(base);
+            let section = &config.value().client;
+            println!("配置文件：{}", config::config_path(base).display());
+            println!("ServerUrl = \"{}\"", section.server_url);
+            println!("EnrollCode = \"{}\"", section.enroll_code);
+            println!("Account = \"{}\"", section.account);
+            println!(
+                "Password = \"{}\"",
+                if section.password.is_empty() {
+                    ""
+                } else {
+                    "enc:v1:***"
+                }
+            );
+            println!("TempDir = \"{}\"", section.temp_dir);
+            println!("WatchRoots = {:?}", section.watch_roots);
+            println!("ReportIntervalSecs = {}", section.report_interval_secs);
+            0
+        }
+        Some("set") => config_set(base, &args[1..]),
+        Some(other) => {
+            eprintln!("未知 config 子命令：{other}（可用：show / set）");
+            2
         }
     }
 }
 
-fn print_status() {
-    println!("Pek.ROutGuard Client {}", env!("CARGO_PKG_VERSION"));
-    println!("容器扩展名：{}", pek_outguard_core::CONTAINER_EXT);
-    println!("阶段：M1 骨架（服务化/监控/加密见 docs/架构设计.md）");
-}
+fn config_set(base: &Path, args: &[String]) -> u8 {
+    let mut section = config::load(base).value().client.clone();
+    let mut index = 0usize;
+    while index < args.len() {
+        let key = args[index].as_str();
+        let value = args.get(index + 1).cloned().unwrap_or_default();
+        match key {
+            "--server" => section.server_url = value.trim().to_string(),
+            "--enroll" => section.enroll_code = value.trim().to_string(),
+            "--account" => section.account = value.trim().to_string(),
+            "--password" => section.password = config::encrypt_password(&value),
+            "--temp" => section.temp_dir = value.trim().to_string(),
+            other => {
+                eprintln!("未知参数：{other}");
+                return 2;
+            }
+        }
+        index += 2;
+    }
 
-fn print_help() {
-    println!("Pek.ROutGuard Client {}", env!("CARGO_PKG_VERSION"));
-    println!();
-    println!("用法：");
-    println!("  pek-outguard-client status            查看版本");
-    println!("  pek-outguard-client open <file>       打开加密容器");
-    println!("  pek-outguard-client version           打印版本");
-    println!("  pek-outguard-client help              显示帮助");
-}
-
-/// 打开容器（骨架阶段：展示头部信息）。
-fn open_container(path: &str) -> ExitCode {
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
+    if section.server_url.trim().is_empty() {
+        eprintln!("ServerUrl 不能为空");
+        return 2;
+    }
+    let config = ClientConfig {
+        client: section.clone(),
+    };
+    match config::save(base, &config) {
+        Ok(path) => {
+            println!("配置已保存：{}", path.display());
+            println!("服务端：{}", section.server_url);
+            println!(
+                "下一步：pek-outguard-client register（注册后需管理员在面板准入）"
+            );
+            0
+        }
         Err(e) => {
-            eprintln!("打开文件失败：{e}");
-            return ExitCode::from(1);
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
+// ————— register / sync / heartbeat —————
+
+fn current_section(base: &Path) -> Result<config::ClientSection, String> {
+    Ok(config::load(base).value().client.clone())
+}
+
+fn build_api(section: &config::ClientSection) -> Result<Api, String> {
+    Api::new(&section.server_url)
+}
+
+fn now_text() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn register_command(base: &Path) -> u8 {
+    let section = match current_section(base) {
+        Ok(section) => section,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let api = match build_api(&section) {
+        Ok(api) => api,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
         }
     };
 
-    let mut reader = std::io::BufReader::new(file);
-    match container::read_header(&mut reader) {
-        Ok(header) => {
-            println!("公司：{}", header.company);
-            println!("密级：{}", header.classification);
-            println!("原始文件：{}（{} 字节）", header.original_name, header.original_size);
-            println!("规则集：{} v{}（规则 {}）", header.policy_id, header.policy_version, header.rule_id);
-            println!("创建者：{} / 终端 {}", header.creator, header.client_id);
-            println!("创建时间：{}", header.created_at);
-            println!();
-            println!("提示：{}", header.notice);
-            println!();
-            println!("（骨架阶段：完整解密打开将在 M1 实现，需要服务端下发的策略密钥）");
-            ExitCode::SUCCESS
+    let mut state = state::load(base);
+    let seed = state::ensure_device_seed(&mut state);
+    let device = match seed_key(&seed) {
+        Ok(device) => device,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+
+    let guid = dhrust::sys::machine::machine_guid().unwrap_or_default();
+    let host = dhrust::sys::machine::hostname();
+    let cpu = dhrust::sys::machine::cpu_model().unwrap_or_default();
+    let machine_id = machine::machine_id(&guid, &host, &cpu)
+        .unwrap_or_else(|_| dhrust::random::hex(16));
+
+    let memory_mb = dhrust::sys::machine::memory_info()
+        .map(|(total, _)| total / (1024 * 1024))
+        .unwrap_or(0);
+
+    let request = RegisterRequest {
+        machine_id: machine_id.clone(),
+        hostname: host,
+        os: dhrust::sys::machine::os_description(),
+        client_version: VERSION.to_string(),
+        public_key: device.public_key_b64(),
+        enroll_code: section.enroll_code.clone(),
+        hardware: Some(HardwareInfo {
+            cpu,
+            memory_mb,
+            disk_total_gb: 0,
+            os_build: String::new(),
+            domain: std::env::var("USERDOMAIN").unwrap_or_default(),
+        }),
+        logged_user: dhrust::sys::machine::user_name(),
+        ip: String::new(),
+        mac: String::new(),
+        installed_at: chrono::Utc::now().timestamp(),
+        account: section.account.clone(),
+        password: config::decrypt_password(&section.password),
+    };
+
+    match api.register(&request) {
+        Ok(response) => {
+            state.client_id = response.client_id.clone();
+            state.client_token = response.client_token.clone();
+            state.status = format!("{:?}", response.status).to_lowercase();
+            if let Err(e) = state::save(base, &state) {
+                eprintln!("{e}");
+                return 1;
+            }
+            println!("注册成功：clientId={} 状态={}", response.client_id, state.status);
+            if state.status == "pending" {
+                println!("终端待管理员在面板准入（准入后才能同步策略）。");
+            }
+            0
         }
         Err(e) => {
-            eprintln!("不是有效的 OutGuard 容器：{e}");
-            ExitCode::from(1)
+            eprintln!("注册失败：{e}");
+            1
         }
+    }
+}
+
+fn sync_command(base: &Path) -> u8 {
+    let section = match current_section(base) {
+        Ok(section) => section,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let api = match build_api(&section) {
+        Ok(api) => api,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let mut state = state::load(base);
+    if state.client_id.is_empty() || state.client_token.is_empty() {
+        eprintln!("尚未注册（先执行 register）");
+        return 1;
+    }
+
+    match api.policy(&state.client_id, &state.client_token) {
+        Ok(bundle) => {
+            println!(
+                "策略已同步：version={} 规则集={} 密钥={} 监控根={}",
+                bundle.version,
+                bundle.policy_sets.len(),
+                bundle.wrapped_keys.len(),
+                bundle.watch_roots.len()
+            );
+            for policy in &bundle.policy_sets {
+                println!(
+                    "  · {}（{}）v{} 规则 {} 条，默认 {}",
+                    policy.name,
+                    policy.id,
+                    policy.version,
+                    policy.rules.len(),
+                    policy.default_action.as_str()
+                );
+            }
+            state.policy_version = bundle.version;
+            state.policy = Some(bundle);
+            state.last_sync = now_text();
+            state.status = "active".into();
+            if let Err(e) = state::save(base, &state) {
+                eprintln!("{e}");
+                return 1;
+            }
+            if state.policy.as_ref().is_some_and(|bundle| bundle.watch_roots.is_empty()) {
+                println!("注意：服务端未配置 WatchRoots，客户端暂不会自动监控目录（可用 encrypt 手动加密）。");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("同步失败：{e}");
+            if e.contains("待管理员准入") {
+                println!("提示：请管理员在面板「终端」页把该终端设为 active。");
+            }
+            1
+        }
+    }
+}
+
+fn heartbeat_command(base: &Path) -> u8 {
+    let section = match current_section(base) {
+        Ok(section) => section,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let api = match build_api(&section) {
+        Ok(api) => api,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    let mut state = state::load(base);
+    if state.client_id.is_empty() {
+        eprintln!("尚未注册（先执行 register）");
+        return 1;
+    }
+
+    let request = HeartbeatRequest {
+        client_id: state.client_id.clone(),
+        client_version: VERSION.to_string(),
+        policy_version: state.policy_version,
+        hostname: None,
+        logged_user: None,
+        os: None,
+        health: None,
+        anomalies: None,
+        ip: None,
+        mac: None,
+        hardware: None,
+    };
+    match api.heartbeat(&state.client_id.clone(), &state.client_token.clone(), &request) {
+        Ok(response) => {
+            state.last_heartbeat = now_text();
+            let _ = state::save(base, &state);
+            println!(
+                "心跳成功：期望策略版本={} 指令={:?}",
+                response.policy_version, response.commands
+            );
+            if response.policy_version != state.policy_version {
+                println!("策略版本不一致，请执行 sync。");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("心跳失败：{e}");
+            1
+        }
+    }
+}
+
+// ————— encrypt / decrypt / open —————
+
+fn encrypt_command(base: &Path, path: Option<&str>) -> u8 {
+    let Some(path) = path else {
+        eprintln!("用法：pek-outguard-client encrypt <file>");
+        return 2;
+    };
+    let state = state::load(base);
+    if state.policy.is_none() {
+        eprintln!("尚未同步策略（先执行 sync）");
+        return 1;
+    }
+    match ops::encrypt_file(&state, Path::new(path)) {
+        Ok(outcome) => {
+            println!(
+                "已加密：{} → {}（规则集 {} / 规则 {}，明文 {} 字节）",
+                path,
+                outcome.output.display(),
+                outcome.policy_id,
+                outcome.rule_id,
+                outcome.plain_size
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("加密失败：{e}");
+            1
+        }
+    }
+}
+
+fn decrypt_command(base: &Path, args: &[String]) -> u8 {
+    let mut path: Option<&str> = None;
+    let mut out_dir: Option<String> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--out" => {
+                out_dir = args.get(index + 1).cloned();
+                index += 2;
+            }
+            other => {
+                path = Some(other);
+                index += 1;
+            }
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("用法：pek-outguard-client decrypt <file> [--out DIR]");
+        return 2;
+    };
+
+    let section = match current_section(base) {
+        Ok(section) => section,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let state = state::load(base);
+    let target = match out_dir {
+        Some(dir) => PathBuf::from(dir),
+        None => config::temp_dir(&section),
+    };
+    match ops::decrypt_file(&state, Path::new(path), &target) {
+        Ok(output) => {
+            println!("已解密：{}", output.display());
+            0
+        }
+        Err(e) => {
+            eprintln!("解密失败：{e}");
+            1
+        }
+    }
+}
+
+fn open_command(base: &Path, path: Option<&str>) -> u8 {
+    let Some(path) = path else {
+        eprintln!("用法：pek-outguard-client open <file>");
+        return 2;
+    };
+    let section = match current_section(base) {
+        Ok(section) => section,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let state = state::load(base);
+    let temp = config::temp_dir(&section);
+    match ops::open_file(&state, Path::new(path), &temp) {
+        Ok(output) => {
+            println!("已解密并交给默认程序：{}", output.display());
+            println!("提示：受控临时目录为 {}（关闭程序后可删除）", temp.display());
+            0
+        }
+        Err(e) => {
+            eprintln!("打开失败：{e}");
+            1
+        }
+    }
+}
+
+// ————— 辅助 —————
+
+fn seed_key(seed_hex: &str) -> Result<DeviceKey, String> {
+    let seed = decode_seed(seed_hex)?;
+    Ok(DeviceKey::from_seed(&seed))
+}
+
+fn decode_seed(hex_text: &str) -> Result<[u8; 32], String> {
+    let text = hex_text.trim();
+    if text.len() != 64 {
+        return Err(format!("设备种子长度非法：{}（期望 64 位 hex）", text.len()));
+    }
+    let bytes = text.as_bytes();
+    let mut out = [0u8; 32];
+    for (index, slot) in out.iter_mut().enumerate() {
+        let high = hex_val(bytes[index * 2])?;
+        let low = hex_val(bytes[index * 2 + 1])?;
+        *slot = (high << 4) | low;
+    }
+    Ok(out)
+}
+
+fn hex_val(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        other => Err(format!("设备种子含非法字符：{}", other as char)),
     }
 }
