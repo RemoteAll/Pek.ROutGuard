@@ -13,19 +13,76 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// 内置系统排除的伪规则 ID（审计里便于区分"被系统保护规则放行"）。
-pub const BUILTIN_EXCLUDE_RULE_ID: &str = "builtin:system";
+/// 硬保护伪规则 ID：操作系统自身目录/文件，**任何规则都不能覆盖**。
+///
+/// 这是「不影响系统本身文件」的最后一道闸：即使管理员误配了指向 `C:\Windows` 的加密规则，
+/// 也不会生效（会在审计里留下 `builtin:system` 记录）。
+pub const HARD_PROTECT_RULE_ID: &str = "builtin:system";
+/// 软排除伪规则 ID：临时目录/开发缓存，**在规则之前**即放行（避免通用扩展名规则误加密）。
+pub const SOFT_EXCLUDE_RULE_ID: &str = "builtin:default-exclude";
 /// 规则集排除路径的伪规则 ID。
 pub const POLICY_EXCLUDE_RULE_ID: &str = "policy:exclude";
 
-/// 内置排除的路径片段（小写比较；两侧带分隔符以避免误伤同名目录）。
-const BUILTIN_EXCLUDE_SEGMENTS: &[&str] = &[
+/// 兼容旧名（等价于硬保护）。
+pub const BUILTIN_EXCLUDE_RULE_ID: &str = HARD_PROTECT_RULE_ID;
+
+/// 系统保护级别（服务端配置 `watch_roots`、面板预览、客户端审计共用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protection {
+    /// 不受保护（可被规则加密）。
+    None,
+    /// 硬保护：操作系统自身目录/文件，任何规则都不能加密。
+    Hard,
+    /// 软排除：临时目录/开发缓存，默认放行（且不可被通用规则覆盖）。
+    Soft,
+}
+
+/// 硬保护：操作系统目录（段匹配）。
+///
+/// **不绑定 `C:`**：Windows 可安装在任意盘符（`D:\Windows`），也兼容老系统的 `WINNT`。
+const HARD_EXCLUDE_SEGMENTS: &[&str] = &[
     "\\windows\\",
+    "\\winnt\\",
     "\\program files\\",
     "\\program files (x86)\\",
     "\\$recycle.bin\\",
     "\\system volume information\\",
+    "\\config.msi\\",
+    "\\documents and settings\\",
+];
+
+/// 硬保护：盘符根下的系统目录（`X:\boot\`、`X:\efi\` 等）。
+///
+/// 仅对「盘符根」生效，所以 `D:\Work\boot\` 这类业务目录不受影响；UNC 共享盘不按此规则。
+const HARD_DRIVE_ROOT_DIRS: &[&str] = &["boot", "efi", "recovery", "perflogs", "$winreagent"];
+
+/// 硬保护：系统文件名（任意层级都不得加密）。
+const HARD_FILE_NAMES: &[&str] = &[
+    "pagefile.sys",
+    "hiberfil.sys",
+    "swapfile.sys",
+    "dumpstack.log.tmp",
+    "ntuser.dat",
+    "ntuser.ini",
+    "bootmgr",
+    "bootnxt",
+];
+
+/// 软排除：临时目录与开发缓存（在规则之前放行，避免程序/编译被破坏）。
+///
+/// 有意**不包含 `ProgramData`**：它常放业务数据，需由具体规则决定（见测试
+/// `programdata_is_rulable_when_explicitly_targeted`）。
+const SOFT_EXCLUDE_SEGMENTS: &[&str] = &[
     "\\appdata\\local\\temp\\",
+    "\\appdata\\local\\microsoft\\windows\\",
+    "\\appdata\\local\\packages\\",
+    "\\appdata\\local\\crashdumps\\",
+    "\\.git\\",
+    "\\.svn\\",
+    "\\.hg\\",
+    "\\node_modules\\",
+    "\\__pycache__\\",
+    "\\.vs\\",
 ];
 
 /// 命中后的动作。
@@ -201,17 +258,31 @@ impl Decision {
 
 impl PolicySet {
     /// 执行判定。
+    ///
+    /// 顺序：硬保护 → 软排除 → 规则集排除路径 → 规则（优先级降序）→ 默认动作。
+    /// 前两步保证「不影响系统本身文件」：系统目录与临时/缓存目录永远先放行，
+    /// 连误配的加密规则都碰不到它们。
     pub fn evaluate(&self, ctx: &FileContext<'_>) -> Decision {
         let path_norm = normalize_path(ctx.path);
         let name = file_name(&path_norm);
 
-        if is_builtin_excluded(&path_norm) {
+        // 1. 硬保护：操作系统自身目录/文件（任何规则都不可覆盖）。
+        if is_hard_protected(&path_norm) {
             return Decision {
                 action: Action::Plaintext,
-                rule_id: Some(BUILTIN_EXCLUDE_RULE_ID.to_string()),
+                rule_id: Some(HARD_PROTECT_RULE_ID.to_string()),
             };
         }
 
+        // 2. 软排除：临时目录/开发缓存（在规则之前，防止通用扩展名规则误加密）。
+        if is_soft_excluded(&path_norm) {
+            return Decision {
+                action: Action::Plaintext,
+                rule_id: Some(SOFT_EXCLUDE_RULE_ID.to_string()),
+            };
+        }
+
+        // 3. 规则集显式排除（管理员明确不放行的路径）。
         if self
             .exclude_paths
             .iter()
@@ -223,8 +294,8 @@ impl PolicySet {
             };
         }
 
+        // 4. 规则（按优先级降序；同级保持声明顺序）。
         let mut ordered: Vec<&Rule> = self.rules.iter().collect();
-        // 稳定排序：同优先级保持声明顺序。
         ordered.sort_by_key(|rule| std::cmp::Reverse(rule.priority));
         for rule in ordered {
             if rule.matches(&path_norm, name, ctx) {
@@ -235,6 +306,7 @@ impl PolicySet {
             }
         }
 
+        // 5. 规则集默认动作。
         Decision {
             action: self.default_action,
             rule_id: None,
@@ -303,12 +375,59 @@ pub fn path_has_prefix(path_norm: &str, prefix: &str) -> bool {
     path.starts_with(&format!("{prefix}\\"))
 }
 
-/// 内置系统排除。
-fn is_builtin_excluded(path_norm: &str) -> bool {
+/// 判断路径是否命中硬保护（操作系统自身目录/文件）。
+///
+/// 供服务端配置 `watch_roots` 时排除、面板预览提示、客户端审计标识。
+pub fn is_hard_protected(path: &str) -> bool {
+    let path_norm = normalize_path(path);
     let lower = format!("{}\\", path_norm.to_ascii_lowercase());
-    BUILTIN_EXCLUDE_SEGMENTS
+
+    if HARD_EXCLUDE_SEGMENTS
         .iter()
         .any(|segment| lower.contains(segment))
+    {
+        return true;
+    }
+
+    // 盘符根下的系统目录（`X:\boot\...`）；UNC 共享盘不按此判定。
+    if let Some(rest) = strip_drive_root(&path_norm) {
+        let first = rest.split('\\').next().unwrap_or("").to_ascii_lowercase();
+        if HARD_DRIVE_ROOT_DIRS.iter().any(|dir| first == *dir) {
+            return true;
+        }
+    }
+
+    let name = file_name(&path_norm).to_ascii_lowercase();
+    HARD_FILE_NAMES.iter().any(|candidate| name == *candidate)
+}
+
+/// 判断路径是否命中软排除（临时目录/开发缓存）。
+pub fn is_soft_excluded(path: &str) -> bool {
+    let lower = format!("{}\\", normalize_path(path).to_ascii_lowercase());
+    SOFT_EXCLUDE_SEGMENTS
+        .iter()
+        .any(|segment| lower.contains(segment))
+}
+
+/// 系统保护级别查询。
+pub fn system_protection(path: &str) -> Protection {
+    if is_hard_protected(path) {
+        Protection::Hard
+    } else if is_soft_excluded(path) {
+        Protection::Soft
+    } else {
+        Protection::None
+    }
+}
+
+/// 取盘符根之后的相对部分（`D:\boot\a` → `boot\a`）；非盘符路径返回 `None`。
+fn strip_drive_root(path: &str) -> Option<&str> {
+    let bytes = path.as_bytes();
+    if bytes.len() > 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\' {
+        Some(&path[3..])
+    } else {
+        None
+    }
 }
 
 fn file_name(path_norm: &str) -> &str {
@@ -401,22 +520,113 @@ mod tests {
     }
 
     #[test]
-    fn builtin_system_paths_are_excluded() {
+    fn hard_protected_system_paths_cannot_be_overridden() {
+        // 故意写一条"想加密 Windows 目录"的规则：硬保护必须仍然放行。
         let mut encrypt = rule("encrypt", 10, Action::Encrypt);
         encrypt.extensions = vec!["dll".into()];
+        encrypt.path_prefixes = vec!["C:\\Windows".into()];
         let policy = policy(vec![encrypt]);
 
         let decision = policy.evaluate(&ctx("C:\\Windows\\System32\\demo.dll", 10, None));
         assert_eq!(decision.action, Action::Plaintext);
-        assert_eq!(decision.rule_id.as_deref(), Some(BUILTIN_EXCLUDE_RULE_ID));
+        assert_eq!(decision.rule_id.as_deref(), Some(HARD_PROTECT_RULE_ID));
+    }
+
+    #[test]
+    fn system_dirs_are_hard_protected_on_any_volume_and_legacy_name() {
+        let mut encrypt = rule("any", 1, Action::Encrypt);
+        encrypt.extensions = vec!["*".into()];
+        let policy = policy(vec![encrypt]);
+
+        for path in [
+            "D:\\Windows\\System32\\a.txt",
+            "C:\\WINNT\\system32\\a.txt",
+            "C:\\Program Files\\App\\a.txt",
+            "C:\\Program Files (x86)\\App\\a.txt",
+            "C:\\$Recycle.Bin\\a.txt",
+            "C:\\System Volume Information\\a.txt",
+        ] {
+            let decision = policy.evaluate(&ctx(path, 1, None));
+            assert_eq!(
+                decision.rule_id.as_deref(),
+                Some(HARD_PROTECT_RULE_ID),
+                "{path} 必须是硬保护"
+            );
+        }
+    }
+
+    #[test]
+    fn drive_root_system_dirs_are_hard_protected() {
+        for path in [
+            "D:\\Boot\\BCD",
+            "D:\\EFI\\Boot\\bootmgfw.efi",
+            "D:\\Recovery\\a.txt",
+        ] {
+            assert!(is_hard_protected(path), "{path} 必须是硬保护");
+        }
+        // 业务目录里同名的 boot 不受影响（不在盘符根）。
+        assert!(!is_hard_protected("D:\\Work\\boot\\readme.txt"));
+        // UNC 共享盘上的 boot 目录是业务数据，不按盘符根处理。
+        assert!(!is_hard_protected("\\\\nas\\share\\boot\\a.txt"));
+    }
+
+    #[test]
+    fn system_files_are_hard_protected() {
+        for path in [
+            "C:\\pagefile.sys",
+            "D:\\pagefile.sys",
+            "C:\\hiberfil.sys",
+            "C:\\Users\\a\\NTUSER.DAT",
+            "C:\\Users\\a\\ntuser.ini",
+        ] {
+            assert!(is_hard_protected(path), "{path} 必须是硬保护");
+        }
+    }
+
+    #[test]
+    fn cache_dirs_are_soft_excluded_before_rules() {
+        let mut encrypt = rule("docx", 10, Action::Encrypt);
+        encrypt.extensions = vec!["docx".into()];
+        let policy = policy(vec![encrypt]);
 
         let decision = policy.evaluate(&ctx(
             "C:\\Users\\a\\AppData\\Local\\Temp\\x.docx",
-            10,
+            1,
             None,
         ));
+        assert_eq!(
+            decision.action,
+            Action::Plaintext,
+            "临时目录不得被通用扩展名规则误加密"
+        );
+        assert_eq!(decision.rule_id.as_deref(), Some(SOFT_EXCLUDE_RULE_ID));
+
+        let decision = policy.evaluate(&ctx("D:\\Work\\node_modules\\pkg\\a.docx", 1, None));
         assert_eq!(decision.action, Action::Plaintext);
-        assert_eq!(decision.rule_id.as_deref(), Some(BUILTIN_EXCLUDE_RULE_ID));
+        assert_eq!(decision.rule_id.as_deref(), Some(SOFT_EXCLUDE_RULE_ID));
+    }
+
+    #[test]
+    fn programdata_is_rulable_when_explicitly_targeted() {
+        // ProgramData 不内置排除（常放业务数据）：显式路径规则可以加密它。
+        let mut encrypt = rule("export", 10, Action::Encrypt);
+        encrypt.extensions = vec!["csv".into()];
+        encrypt.path_prefixes = vec!["C:\\ProgramData\\MyApp\\export".into()];
+        let policy = policy(vec![encrypt]);
+
+        let decision = policy.evaluate(&ctx("C:\\ProgramData\\MyApp\\export\\a.csv", 1, None));
+        assert_eq!(decision.action, Action::Encrypt);
+        assert_eq!(decision.rule_id.as_deref(), Some("export"));
+    }
+
+    #[test]
+    fn protection_levels_are_queryable() {
+        assert_eq!(system_protection("C:\\Windows\\a.txt"), Protection::Hard);
+        assert_eq!(
+            system_protection("C:\\Users\\a\\AppData\\Local\\Temp\\a.txt"),
+            Protection::Soft
+        );
+        assert_eq!(system_protection("D:\\Work\\a.docx"), Protection::None);
     }
 
     #[test]

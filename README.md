@@ -11,6 +11,7 @@
 core/      pek-outguard-core    容器格式 / 规则引擎 / 协议 / 密钥派生
 server/    pek-outguard-server  管理端（Web 面板 + 客户端接口 + 数据库）
 client/    pek-outguard-client  终端（Windows 服务 + 文件监控 + 加密执行）
+admin/     Tauri 桌面外壳（M2，加载同一套面板）
 docs/      需求说明书 / 架构设计 / 决策记录 / 项目接续
 tools/     接续基建（自检 + 记忆回灌）
 ```
@@ -29,6 +30,7 @@ cargo build --release
 
 - [需求说明书](docs/需求说明书.md)
 - [架构设计](docs/架构设计.md)
+- [外发审批与外发包设计](docs/外发审批与外发包设计.md)
 - [决策记录](docs/决策记录.md)
 - [项目接续指南](docs/项目接续指南.md)
 
