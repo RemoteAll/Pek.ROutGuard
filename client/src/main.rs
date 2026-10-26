@@ -20,10 +20,9 @@ use std::process::ExitCode;
 use dhrust::logs::LogLevel;
 use pek_outguard_client::api::Api;
 use pek_outguard_client::config::{self, ClientConfig};
-use pek_outguard_client::{VERSION, base_dir, ops, state};
+use pek_outguard_client::{VERSION, base_dir, ops, runtime, service, state};
 use pek_outguard_core::machine;
 use pek_outguard_core::protocol::{HardwareInfo, HeartbeatRequest, RegisterRequest};
-use pek_outguard_core::signature::DeviceKey;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -42,6 +41,15 @@ fn main() -> ExitCode {
         Some("encrypt") => encrypt_command(&base, args.get(1).map(String::as_str)),
         Some("decrypt") => decrypt_command(&base, args.get(1..).unwrap_or(&[])),
         Some("open") => open_command(&base, args.get(1).map(String::as_str)),
+        Some("install") => install_command(&base),
+        Some("uninstall") => {
+            uninstall_command(&base, args.iter().any(|arg| arg == "--force"))
+        }
+        Some("start") => service_action(&base, "start"),
+        Some("stop") => service_action(&base, "stop"),
+        Some("restart") => service_action(&base, "restart"),
+        Some("run") => run_command(&base),
+        Some("-s") | Some("--service") | Some("service") => service_mode(&base),
         Some("version") | Some("--version") | Some("-version") => {
             println!("Pek.ROutGuard Client v{VERSION}");
             0
@@ -77,7 +85,10 @@ fn print_help() {
          \x20 pek-outguard-client open <file>            解密并用默认程序打开\n\
          \x20 pek-outguard-client version / help\n\
          \n\
-         说明：客户端可配置但**不可停止、不可卸载**；卸载需服务端授权（M2）。"
+         服务化（需管理员权限）：\n\
+         \x20 install / uninstall [--force] / start / stop / restart / run / status\n\
+         \n\
+         说明：客户端可配置但**不可停止、不可卸载**；卸载默认需服务端允许（AllowUninstall）。"
     );
 }
 
@@ -134,7 +145,12 @@ fn status_command(base: &Path) -> u8 {
     );
     println!("待上报事件：{}", state.pending_events.len());
     println!("受控临时目录：{}", config::temp_dir(section).display());
-    println!("提示：客户端不可停止、不可卸载；卸载需服务端授权（M2）。");
+    println!(
+        "服务：{}（{}）",
+        service::SERVICE_NAME,
+        service::query(base).text()
+    );
+    println!("提示：客户端不可停止、不可卸载；卸载需服务端授权。");
     0
 }
 
@@ -243,7 +259,7 @@ fn register_command(base: &Path) -> u8 {
 
     let mut state = state::load(base);
     let seed = state::ensure_device_seed(&mut state);
-    let device = match seed_key(&seed) {
+    let device = match runtime::seed_key(&seed) {
         Ok(device) => device,
         Err(e) => {
             eprintln!("{e}");
@@ -525,33 +541,102 @@ fn open_command(base: &Path, path: Option<&str>) -> u8 {
     }
 }
 
+// ————— 服务化 —————
+
+fn install_command(base: &Path) -> u8 {
+    match service::install(base, true) {
+        Ok(()) => {
+            println!("服务已安装并启动：{}", service::SERVICE_NAME);
+            println!("已设置失败恢复策略（崩溃 5s/10s/30s 自动重启）。");
+            println!("查看状态：pek-outguard-client status");
+            0
+        }
+        Err(e) => {
+            eprintln!("安装失败（需管理员权限）：{e}");
+            1
+        }
+    }
+}
+
+fn uninstall_command(base: &Path, force: bool) -> u8 {
+    let state = state::load(base);
+    let allowed = state
+        .policy
+        .as_ref()
+        .map(|bundle| bundle.allow_uninstall)
+        .unwrap_or(false);
+    if !allowed && !force {
+        eprintln!("⚠ 卸载被拒绝：需管理员在服务端配置 AllowUninstall = true（客户端下次同步后生效）。");
+        eprintln!("  确需强制卸载请使用 --force（会记录审计，不推荐）。");
+        return 1;
+    }
+    if force && !allowed {
+        dhrust::warn!("强制卸载（--force）：未获服务端授权");
+    }
+    match service::uninstall(base) {
+        Ok(()) => {
+            println!("服务已卸载：{}", service::SERVICE_NAME);
+            0
+        }
+        Err(e) => {
+            eprintln!("卸载失败（需管理员权限）：{e}");
+            1
+        }
+    }
+}
+
+fn service_action(base: &Path, action: &str) -> u8 {
+    let manager = service::manager(base);
+    let result = match action {
+        "start" => manager.start(),
+        "stop" => manager.stop(),
+        "restart" => manager.restart(),
+        _ => return 2,
+    };
+    match result {
+        Ok(()) => {
+            println!("服务 {action} 成功");
+            0
+        }
+        Err(e) => {
+            eprintln!("服务 {action} 失败：{e}");
+            1
+        }
+    }
+}
+
+fn run_command(base: &Path) -> u8 {
+    println!("客户端前台运行（Ctrl+C 退出）…");
+    match runtime::run(base) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("运行失败：{e}");
+            1
+        }
+    }
+}
+
+fn service_mode(base: &Path) -> u8 {
+    #[cfg(windows)]
+    {
+        let base_owned = base.to_path_buf();
+        dhrust::service::windows::run_as_service(
+            service::SERVICE_NAME,
+            runtime::request_stop,
+            move || {
+                if let Err(e) = runtime::run(&base_owned) {
+                    dhrust::error!("客户端运行失败：{e}");
+                }
+            },
+        );
+        0
+    }
+    #[cfg(not(windows))]
+    {
+        run_command(base)
+    }
+}
+
 // ————— 辅助 —————
 
-fn seed_key(seed_hex: &str) -> Result<DeviceKey, String> {
-    let seed = decode_seed(seed_hex)?;
-    Ok(DeviceKey::from_seed(&seed))
-}
-
-fn decode_seed(hex_text: &str) -> Result<[u8; 32], String> {
-    let text = hex_text.trim();
-    if text.len() != 64 {
-        return Err(format!("设备种子长度非法：{}（期望 64 位 hex）", text.len()));
-    }
-    let bytes = text.as_bytes();
-    let mut out = [0u8; 32];
-    for (index, slot) in out.iter_mut().enumerate() {
-        let high = hex_val(bytes[index * 2])?;
-        let low = hex_val(bytes[index * 2 + 1])?;
-        *slot = (high << 4) | low;
-    }
-    Ok(out)
-}
-
-fn hex_val(byte: u8) -> Result<u8, String> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        other => Err(format!("设备种子含非法字符：{}", other as char)),
-    }
-}
+// 设备种子解码与密钥构造已下沉 `runtime`（避免两处实现漂移）。

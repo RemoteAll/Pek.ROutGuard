@@ -213,6 +213,9 @@ pub struct PolicyBundle {
     /// 默认密级。
     #[serde(default)]
     pub classification: String,
+    /// 是否允许客户端卸载（服务端授权；默认 false，避免员工自行卸载）。
+    #[serde(default)]
+    pub allow_uninstall: bool,
     /// 服务端时间（unix 秒）。
     pub server_time: i64,
 }
@@ -494,6 +497,7 @@ mod tests {
             company: "示例科技有限公司".into(),
             notice: "本文件已加密".into(),
             classification: "内部".into(),
+            allow_uninstall: false,
             server_time: 1_800_000_000,
         };
 

@@ -28,3 +28,5 @@ WatchRoots = []
 ExcludePaths = []
 # 离线宽限天数（0 = 不限制；超期后按策略禁止打开）
 OfflineGraceDays = 7
+# 是否允许客户端卸载（默认 false；确需卸载时改为 true，客户端下次同步生效）
+AllowUninstall = false

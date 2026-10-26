@@ -235,6 +235,7 @@ mod tests {
             company: "示例科技有限公司".into(),
             notice: "本文件已加密".into(),
             classification: "内部".into(),
+            allow_uninstall: false,
             server_time: 0,
         };
         ClientState {

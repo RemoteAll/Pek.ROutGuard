@@ -9,7 +9,10 @@
 pub mod api;
 pub mod config;
 pub mod ops;
+pub mod runtime;
+pub mod service;
 pub mod state;
+pub mod watch;
 
 use std::path::PathBuf;
 

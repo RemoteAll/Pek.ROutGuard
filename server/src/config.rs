@@ -49,6 +49,8 @@ pub struct ServerSection {
     pub exclude_paths: Vec<String>,
     /// 离线宽限天数（0 = 不限制）
     pub offline_grace_days: u32,
+    /// 是否允许客户端卸载（默认 false；需临时放开时由管理员改为 true，客户端下次同步生效）
+    pub allow_uninstall: bool,
 }
 
 impl Default for ServerSection {
@@ -68,6 +70,7 @@ impl Default for ServerSection {
             watch_roots: Vec::new(),
             exclude_paths: Vec::new(),
             offline_grace_days: 7,
+            allow_uninstall: false,
         }
     }
 }

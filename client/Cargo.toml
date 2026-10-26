@@ -9,11 +9,13 @@ description = "Pek.ROutGuard 终端：服务常驻 / 文件监控 / 自动加密
 [dependencies]
 # 双端共享：容器格式、规则引擎、协议模型、密钥派生
 pek-outguard-core = { path = "../core" }
-# 阻塞 HTTP（注册/心跳/策略/事件）+ TOML 配置 + 凭据可逆加密（enc:v1）
-dhrust = { path = "../../DH.RustBase", features = ["http-client", "toml", "secret"] }
+# 阻塞 HTTP（注册/心跳/策略/事件）+ TOML 配置 + 凭据可逆加密 + 服务化（Windows 服务/系统服务）
+dhrust = { path = "../../DH.RustBase", features = ["http-client", "toml", "secret", "service"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = "0.4"
 base64 = { workspace = true }
 # 配置写回（TOML 序列化）
 toml = "1"
+# 文件系统事件监控（Windows ReadDirectoryChangesW / Linux inotify；纯 Rust 可交叉编译）
+notify = "6"
