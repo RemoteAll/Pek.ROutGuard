@@ -1,4 +1,4 @@
-//! Pek.ROutGuard Client —— 终端（库形态，供 bin 与测试共用）。
+﻿//! Pek.ROutGuard Client —— 终端（库形态，供 bin 与测试共用）。
 //!
 //! 设计口径：
 //! - **配置可改、保护不可停**：客户端提供配置入口（Server 地址 / 账号密码），但**不提供停止保护与卸载**；
@@ -14,6 +14,7 @@ pub mod ops;
 pub mod projfs;
 pub mod runtime;
 pub mod safety;
+pub mod secure_area;
 pub mod service;
 pub mod state;
 pub mod watch;

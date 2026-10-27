@@ -20,7 +20,9 @@ use std::process::ExitCode;
 use dhrust::logs::LogLevel;
 use pek_outguard_client::api::Api;
 use pek_outguard_client::config::{self, ClientConfig};
-use pek_outguard_client::{VERSION, assoc, base_dir, opensession, ops, runtime, safety, service, state};
+use pek_outguard_client::{
+    VERSION, assoc, base_dir, opensession, ops, projfs, runtime, safety, secure_area, service, state, watch,
+};
 use pek_outguard_core::machine;
 use pek_outguard_core::protocol::{HardwareInfo, HeartbeatRequest, RegisterRequest};
 
@@ -42,6 +44,7 @@ fn main() -> ExitCode {
         Some("decrypt") => decrypt_command(&base, args.get(1..).unwrap_or(&[])),
         Some("open") => open_command(&base, args.get(1).map(String::as_str)),
         Some("sessions") => sessions_command(&base),
+        Some("secure-area") => secure_area_command(&base, args.get(1..).unwrap_or(&[])),
         Some("mode") => mode_command(&base, args.get(1..).unwrap_or(&[])),
         Some("install") => install_command(&base),
         Some("uninstall") => {
@@ -685,6 +688,142 @@ fn open_command(base: &Path, path: Option<&str>) -> u8 {
             1
         }
     }
+}
+
+/// 安全区（ProjFS 透明目录）：`status` 检查可用性，`run` 前台运行便于调测。
+fn secure_area_command(base: &Path, args: &[String]) -> u8 {
+    let root_arg = arg_value(args, "--root").or_else(|| {
+        args.first()
+            .filter(|value| !value.starts_with("--"))
+            .cloned()
+    });
+    let probe = projfs::probe();
+    if !probe.supported {
+        eprintln!("{}", probe.detail);
+        return 1;
+    }
+
+    match args.first().map(String::as_str) {
+        Some("status") => {
+            println!("ProjFS：{}", probe.detail);
+            match &root_arg {
+                Some(root) => match secure_area::check_area(Path::new(root)) {
+                    Ok(()) => {
+                        println!("安全区 {root}：可直接启用（目录为空）");
+                        0
+                    }
+                    Err(e) => {
+                        println!("安全区 {root}：{e}");
+                        1
+                    }
+                },
+                None => {
+                    println!("用法：secure-area status --root <目录>");
+                    0
+                }
+            }
+        }
+        Some("run") => {
+            let Some(root) = root_arg else {
+                eprintln!("用法：secure-area run --root <空目录> [--vault <密文库>]");
+                return 2;
+            };
+            let root = PathBuf::from(root);
+            if let Err(e) = secure_area::check_area(&root) {
+                eprintln!("无法启用安全区：{e}");
+                return 1;
+            }
+            let state = state::load(base);
+            if state.policy.is_none() {
+                eprintln!("尚未同步策略（先执行 sync）");
+                return 1;
+            }
+            let name = root
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| "secure".to_string());
+            let vault = arg_value(args, "--vault")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| base.join("Data").join("Vault").join(&name));
+            let cache = base.join("Data").join("VaultCache").join(&name);
+
+            let key_state = state.clone();
+            let resolver: std::sync::Arc<secure_area::KeyResolver> =
+                std::sync::Arc::new(move |policy_id: &str| {
+                    ops::policy_key(&key_state, policy_id).ok()
+                });
+            let bundle = state.policy.clone();
+            let policy_id = bundle
+                .as_ref()
+                .and_then(|b| b.policy_sets.first().map(|policy| policy.id.clone()))
+                .unwrap_or_else(|| "default".to_string());
+            let area = match secure_area::start(
+                secure_area::SecureAreaOptions {
+                    root: root.clone(),
+                    vault: vault.clone(),
+                    cache,
+                    policy_id,
+                    company: bundle.as_ref().map(|b| b.company.clone()).unwrap_or_default(),
+                    notice: bundle.as_ref().map(|b| b.notice.clone()).unwrap_or_default(),
+                    classification: bundle
+                        .as_ref()
+                        .map(|b| b.classification.clone())
+                        .unwrap_or_default(),
+                },
+                resolver,
+            ) {
+                Ok(area) => area,
+                Err(e) => {
+                    eprintln!("启动失败：{e}");
+                    return 1;
+                }
+            };
+
+            // 写入落盘加密：用户保存后 ProjFS 会落成实体明文，必须马上搬进密文库。
+            // 用文件监控（去抖 1.5 s）而不是轮询，符合“变化驱动”的资源约定。
+            let seal_area = std::sync::Arc::new(area);
+            let seal_handle = watch::start(
+                vec![root.clone()],
+                std::time::Duration::from_millis(1500),
+                {
+                    let seal_area = std::sync::Arc::clone(&seal_area);
+                    move |_path: std::path::PathBuf| {
+                        seal_area.seal_dirty();
+                    }
+                },
+            );
+            let _seal_handle = match seal_handle {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    dhrust::warn!("安全区落盘加密监控未启动：{e}（保存后可能残留明文）");
+                    None
+                }
+            };
+            println!("安全区已启用：{}", root.display());
+            println!("  密文库：{}", vault.display());
+            println!("  在资源管理器打开该目录，看到的应是普通文件名（没有 .ogd）。");
+            println!("按 Ctrl+C 停止。");
+            runtime::STOP.store(false, std::sync::atomic::Ordering::SeqCst);
+            while !runtime::STOP.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            0
+        }
+        _ => {
+            eprintln!("用法：secure-area [status|run] --root <目录> [--vault <密文库>]");
+            eprintln!("  status 检查系统支持与目录是否可启用");
+            eprintln!("  run    前台运行安全区（调试用；正式由客户端服务托管）");
+            2
+        }
+    }
+}
+
+/// 从 `--key value` 形式取参数。
+fn arg_value(args: &[String], key: &str) -> Option<String> {
+    args.iter()
+        .position(|item| item == key)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
 }
 
 /// 列出当前的受控打开会话（明文只在受控临时目录，且会被自动回写）。

@@ -370,7 +370,10 @@ pub fn launch_with_default_app(path: &Path) -> Result<(), String> {
 }
 
 /// 取规则集对应的策略密钥（用终端令牌解包）。
-fn policy_key(state: &ClientState, policy_id: &str) -> Result<[u8; crypto::KEY_LEN], String> {
+/// 取规则集对应的策略密钥（用终端令牌解包）。
+///
+/// 公开给安全区（ProjFS）解密回调复用：回调只拿到容器头里的 `policyId`。
+pub fn policy_key(state: &ClientState, policy_id: &str) -> Result<[u8; crypto::KEY_LEN], String> {
     let bundle = state.policy.as_ref().ok_or("策略未同步")?;
     let wrapped = bundle
         .wrapped_keys
