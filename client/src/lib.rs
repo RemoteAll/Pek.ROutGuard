@@ -6,6 +6,7 @@
 //! - **凭据不明文落盘**：账号密码用 `dhrust::secret`（AES-256-GCM，`enc:v1:`）加密后再写入配置。
 //! - **策略只执行**：规则与策略密钥全部来自服务端；本地缓存放在 `Data/state.json`（0600）。
 
+pub mod ads;
 pub mod api;
 pub mod assoc;
 pub mod config;
@@ -13,6 +14,7 @@ pub mod driver;
 pub mod opensession;
 pub mod ops;
 pub mod projfs;
+pub mod rescue;
 pub mod runtime;
 pub mod safety;
 pub mod secure_area;
@@ -32,3 +34,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 产品名。
 pub const PRODUCT: &str = "Pek.ROutGuard Client";
+
+
+

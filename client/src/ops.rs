@@ -366,7 +366,6 @@ pub fn launch_with_default_app(path: &Path) -> Result<(), String> {
 }
 
 /// 取规则集对应的策略密钥（用终端令牌解包）。
-/// 取规则集对应的策略密钥（用终端令牌解包）。
 ///
 /// 公开给安全区（ProjFS）解密回调复用：回调只拿到容器头里的 `policyId`。
 pub fn policy_key(state: &ClientState, policy_id: &str) -> Result<[u8; crypto::KEY_LEN], String> {

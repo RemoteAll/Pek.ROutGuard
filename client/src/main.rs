@@ -21,10 +21,12 @@ use dhrust::logs::LogLevel;
 use pek_outguard_client::api::Api;
 use pek_outguard_client::config::{self, ClientConfig};
 use pek_outguard_client::{
-    VERSION, assoc, base_dir, driver, opensession, ops, projfs, runtime, safety, secure_area, service, state,
+    VERSION, ads, assoc, base_dir, driver, opensession, ops, projfs, rescue, runtime, safety,
+    secure_area, service, state,
 };
 use pek_outguard_core::machine;
 use pek_outguard_core::protocol::{HardwareInfo, HeartbeatRequest, RegisterRequest};
+use pek_outguard_core::{crypto, xts::XtsCipher};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -47,6 +49,7 @@ fn main() -> ExitCode {
         Some("vault") => vault_command(&base, args.get(1..).unwrap_or(&[])),
         Some("secure-area") => secure_area_command(&base, args.get(1..).unwrap_or(&[])),
         Some("driver") => driver_command(args.get(1..).unwrap_or(&[])),
+        Some("rescue") => rescue_command(&base, args.get(1..).unwrap_or(&[])),
         Some("mode") => mode_command(&base, args.get(1..).unwrap_or(&[])),
         Some("install") => install_command(&base),
         Some("uninstall") => {
@@ -97,7 +100,12 @@ fn print_help() {
          \x20 pek-outguard-client driver status          内核驱动状态与统计（需先装驱动）\n\
          \x20 pek-outguard-client driver rules --ext .docx,.xlsx [--path \"D:\\机密;C:\\图纸\"]\n\
          \x20     \x20 下发受控规则（M1 只判定命中，仍不修改任何文件）\n\
-         \x20 pek-outguard-client driver reset|enable|disable  统计清零 / 启停判定\n\
+         \x20 pek-outguard-client driver reset|enable|disable  统计清零 / 启停判定\
+         \x20 pek-outguard-client rescue info <file>     查看透明加密标记（file_id/时间）\
+         \x20 pek-outguard-client rescue encrypt <file>  【离线】原地加密一个文件（写 :oug 标记）\
+         \x20 pek-outguard-client rescue decrypt <file> --out DIR [--key-hex HEX]\
+         \x20     \x20  【离线救援】解出明文到 DIR，不动原件；驱动坏了也能救\
+         \x20 pek-outguard-client rescue verify <file>   体检：能否完整解密\n\
          \x20 pek-outguard-client mode [show|live --confirm|dry-run]  运行模式（默认演练，不动文件）\n\
          \x20 pek-outguard-client register-assoc        注册 .ogd 关联（双击直接打开，免管理员）\n\
          \x20 pek-outguard-client unregister-assoc      解除 .ogd 关联\n\
@@ -816,6 +824,154 @@ fn vault_command(base: &Path, args: &[String]) -> u8 {
 }
 
 /// 内核驱动控制通道：`status` 看状态与统计，`rules` 下发规则，`reset/enable/disable` 管理。
+fn rescue_command(base: &Path, args: &[String]) -> u8 {
+    let Some(action) = args.first().map(String::as_str) else {
+        eprintln!(
+            "用法：\n  \
+             \x20 rescue info <file>                              查看透明加密标记\n  \
+             \x20 rescue encrypt <file> [--key-hex HEX]           离线原地加密（写 :oug 标记）\n  \
+             \x20 rescue decrypt <file> --out DIR [--key-hex HEX] 离线解密，不动原件\n  \
+             \x20 rescue verify <file> [--key-hex HEX]            体检：能否完整解密"
+        );
+        return 2;
+    };
+
+    // 解析位置参数与 --key-hex / --out
+    let mut file: Option<String> = None;
+    let mut out_dir: Option<String> = None;
+    let mut key_hex: Option<String> = None;
+    let mut index = 1usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--out" => {
+                out_dir = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--key-hex" => {
+                key_hex = args.get(index + 1).cloned();
+                index += 2;
+            }
+            other => {
+                file = Some(other.to_string());
+                index += 1;
+            }
+        }
+    }
+    let Some(file) = file else {
+        eprintln!("缺少文件参数（rescue {action} <file>）");
+        return 2;
+    };
+    let path = Path::new(&file);
+
+    match action {
+        "info" => match rescue::describe(path) {
+            Ok(text) => {
+                println!("{text}");
+                if ads::read_meta(path).ok().flatten().is_none() {
+                    println!("  （该文件没被本产品加密，或复制时 ADS 已丢失）");
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        },
+        "encrypt" => {
+            let cipher = match rescue_cipher(base, key_hex.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return 1;
+                }
+            };
+            match rescue::encrypt_file_in_place(path, &cipher) {
+                Ok(report) => {
+                    println!(
+                        "已加密：{}（{} 字节，file_id={}）\n  提示：明文已从磁盘擦除（临时文件已原子替换）",
+                        path.display(),
+                        report.bytes,
+                        report.file_id.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("加密失败：{e}");
+                    1
+                }
+            }
+        }
+        "decrypt" => {
+            let Some(out) = out_dir else {
+                eprintln!("缺少 --out DIR（解密结果必须写到指定目录，绝不覆盖原件）");
+                return 2;
+            };
+            let cipher = match rescue_cipher(base, key_hex.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return 1;
+                }
+            };
+            match rescue::decrypt_file_to(path, Path::new(&out), &cipher) {
+                Ok((target, report)) => {
+                    println!("已解密：{}（{} 字节）", target.display(), report.bytes);
+                    println!("  原文件未改动：{}", path.display());
+                    0
+                }
+                Err(e) => {
+                    eprintln!("解密失败：{e}");
+                    1
+                }
+            }
+        }
+        "verify" => {
+            let cipher = match rescue_cipher(base, key_hex.as_deref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return 1;
+                }
+            };
+            match rescue::verify(path, &cipher) {
+                Ok(bytes) => {
+                    println!("可解密：{}（{bytes} 字节全部校验通过）", path.display());
+                    0
+                }
+                Err(e) => {
+                    eprintln!("体检失败：{e}");
+                    1
+                }
+            }
+        }
+        other => {
+            eprintln!("未知 rescue 子命令：{other}（可用 info / encrypt / decrypt / verify）");
+            2
+        }
+    }
+}
+
+/// 取透明加密用的 XTS 密钥：优先 `--key-hex`（换机/灾难恢复），否则用本机策略密钥派生。
+fn rescue_cipher(base: &Path, key_hex: Option<&str>) -> Result<XtsCipher, String> {
+    let raw = match key_hex {
+        Some(hex) => rescue::parse_key_hex(hex)?,
+        None => {
+            let state = state::load(base);
+            let policy_id = state
+                .policy
+                .as_ref()
+                .and_then(|bundle| bundle.wrapped_keys.first().map(|k| k.policy_id.clone()))
+                .ok_or(
+                    "本机还没有策略密钥（未注册/未同步）。\n  \
+                     若是在别的机器上做救援，请用 --key-hex 提供 XTS 密钥（128 个十六进制字符）",
+                )?;
+            let policy_key = ops::policy_key(&state, &policy_id)?;
+            crypto::derive_xts_key(&policy_key).to_vec()
+        }
+    };
+    XtsCipher::new(&raw).map_err(|e| format!("构建加密器失败：{e}"))
+}
+
 fn driver_command(args: &[String]) -> u8 {
     let action = args
         .first()

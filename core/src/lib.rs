@@ -1,4 +1,4 @@
-//! Pek.ROutGuard 共享核心。
+﻿//! Pek.ROutGuard 共享核心。
 //!
 //! 本 crate 是 **Server 与 Client 共用的唯一实现**，目的：同一份规则判定与容器格式，
 //! 避免"服务端预览的判定结果"与"客户端实际执行"漂移。
@@ -17,6 +17,7 @@ pub mod container;
 pub mod crypto;
 pub mod error;
 pub mod machine;
+pub mod meta;
 pub mod protocol;
 pub mod rules;
 pub mod signature;
@@ -32,3 +33,4 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 产品名（写入容器头与审计）。
 pub const PRODUCT: &str = "Pek.ROutGuard";
+

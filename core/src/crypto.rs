@@ -87,6 +87,18 @@ pub fn derive_policy_key(
     Ok(okm)
 }
 
+/// 从策略密钥派生**透明加密用的 XTS 密钥**（64 字节 = 两个 AES-256 密钥）。
+///
+/// 用独立的 HKDF info 与 OGD1 容器密钥隔离：同一策略密钥派出的两类密钥互不可推导。
+/// 这样即使某个文件同时存在"容器格式"和"透明加密格式"，也不会共用同一把密钥。
+pub fn derive_xts_key(policy_key: &[u8; KEY_LEN]) -> [u8; 64] {
+    let hkdf = Hkdf::<Sha256>::new(Some(POLICY_KDF_SALT), policy_key);
+    let mut okm = [0u8; 64];
+    // 64 字节远小于 HKDF-SHA256 单次输出上限（255*32），expand 不会失败
+    let _ = hkdf.expand(b"oug/xts/v1", &mut okm);
+    okm
+}
+
 /// 用 KEK 包裹文件密钥（DEK）。
 ///
 /// 返回 `nonce(12) || AES-256-GCM 密文(32 + tag16)`。
