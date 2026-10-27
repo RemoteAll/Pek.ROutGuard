@@ -465,6 +465,9 @@ fn demote_to_placeholder(
 
 /// ProjFS 占位符带"数据按需召回"属性；实体文件没有。
 const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+/// ProjFS 在 provider 停止/水化后可能撤掉 recall 标志，改用"重解析点 + 稀疏"标记。
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
 
 /// 脱水时给 ContentID 换个新值：内容标识变了，ProjFS 才会把本地明文收回去。
 /// （内容没变时若沿用同一个 ContentID，系统会认为“无需更新”，文件就一直留着明文。）
@@ -476,19 +479,46 @@ fn dehydrate_seed() -> u64 {
         .unwrap_or(1)
 }
 
+/// 是否是 ProjFS 占位符（而不是磁盘上的实体明文）。
+///
+/// 实测有两种形态：正常占位符带 `RECALL_ON_DATA_ACCESS`；
+/// provider 停掉或水化后被 ProjFS 改回"重解析点 + 稀疏"（实测 9760）。
+/// 两种都必须认，否则崩溃重启会把自家占位符当成"未加密文件"而拒绝启动。
 fn is_placeholder(meta: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
-    meta.file_attributes() & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0
+    let attrs = meta.file_attributes();
+    if attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0 {
+        return true;
+    }
+    attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 && attrs & FILE_ATTRIBUTE_SPARSE_FILE != 0
 }
 
 impl Drop for SecureArea {
     fn drop(&mut self) {
+        // **停之前先把明文收回去**：ProjFS 一旦停掉，已水化的文件就变回普通实体文件，
+        // 明文会一直躺在磁盘上（升级、重启、崩溃时最容易被忽略）。
+        let inner = unsafe { &*self.inner };
+        let hydrated = inner
+            .hydrated
+            .lock()
+            .map(|map| map.len())
+            .unwrap_or(0);
+        if hydrated > 0 {
+            // 先把已知水化的立刻收回，再全扫兜底（防止有水化但没记上的）。
+            self.dehydrate_idle(std::time::Duration::ZERO);
+        }
+        let sealed = self.seal_dirty();
+        if sealed > 0 {
+            dhrust::warn!(
+                "安全区停止前完成 {sealed} 个文件的收尾（有改动已加密回密文库）"
+            );
+        }
         unsafe {
             PrjStopVirtualizing(self.context);
             // 等回调线程退出后释放上下文。
             drop(Box::from_raw(self.inner as *mut Inner));
         }
-        // 安全第一：停用时清掉明文缓存（不把解密结果留在磁盘上）。
+        // 安全第一：停用时清掉遗留的明文缓存目录（旧版本才有）。
         let _ = std::fs::remove_dir_all(&self.options.cache);
         dhrust::info!("安全区已停止：{}", self.options.root.display());
     }
@@ -645,17 +675,9 @@ pub fn start(options: SecureAreaOptions, key: Arc<KeyResolver>) -> Result<Secure
             options.root.display()
         ));
     }
-    let has_files = std::fs::read_dir(&options.root)
-        .map_err(|e| format!("读取安全区目录失败：{e}"))?
-        .flatten()
-        .next()
-        .is_some();
-    if has_files {
-        return Err(format!(
-            "安全区目录必须为空（ProjFS 要求）：{}",
-            options.root.display()
-        ));
-    }
+    // 与 CLI/服务共用同一套检查：允许残留本程序自己的占位符（崩溃/升级后要能接管），
+    // 只拒绝真正的明文实体文件。
+    check_area(&options.root)?;
     std::fs::create_dir_all(&options.vault).map_err(|e| format!("创建密文库失败：{e}"))?;
     // 旧版会把解密结果写在 `options.cache` 目录里——新版改成按需区间解密，
     // 这里只做一次性清理（不留历史明文残留），不再创建这个目录。
@@ -1069,6 +1091,10 @@ pub fn absorb_existing(options: &SecureAreaOptions, key: &[u8; 32]) -> Result<us
             if meta.is_dir() {
                 stack.push(path.clone());
                 dirs.push(path);
+            } else if is_placeholder(&meta) {
+                // 本程序自己的占位符：这里 ProjFS 还没启动，读它没有意义，
+                // 交给启动后的 seal 兜底（脏数据由 ProjFS 自己保留）。
+                continue;
             } else {
                 files.push(path);
             }
@@ -1177,7 +1203,11 @@ pub fn import_file(
     Ok(vault_path)
 }
 
-/// 安全区是否可用（系统支持 ProjFS 且目录为空）。
+/// 安全区是否可用（系统支持 ProjFS 且目录里没有“别人的实体文件”）。
+///
+/// 注意：**允许残留本程序自己的占位符**。服务被强杀/升级后，目录里会留下
+/// 带“按需召回”属性的占位符文件——那是 ProjFS 的正常产物，重启后要能直接接管；
+/// 若把它们当成“已有文件”而拒绝启动，一次崩溃就会让安全区永久起不来。
 pub fn check_area(root: &Path) -> Result<(), String> {
     if !crate::projfs::is_supported() {
         return Err("系统不支持 ProjFS（需 Windows 10 1809+ / Server 2019+）".into());
@@ -1185,16 +1215,25 @@ pub fn check_area(root: &Path) -> Result<(), String> {
     if !root.is_dir() {
         return Err(format!("安全区目录不存在：{}", root.display()));
     }
-    if std::fs::read_dir(root)
-        .map_err(|e| format!("读取安全区失败：{e}"))?
-        .flatten()
-        .next()
-        .is_some()
-    {
-        return Err(format!(
-            "安全区目录必须为空（已有文件请先移走）：{}",
-            root.display()
-        ));
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            if is_placeholder(&meta) {
+                continue; // 本程序自己的占位符，留着
+            }
+            return Err(format!(
+                "安全区目录里存在未加密的文件，请先移走：{}",
+                entry.path().display()
+            ));
+        }
     }
     Ok(())
 }
