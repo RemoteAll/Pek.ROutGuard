@@ -216,6 +216,12 @@ pub struct PolicyBundle {
     /// 是否允许客户端卸载（服务端授权；默认 false，避免员工自行卸载）。
     #[serde(default)]
     pub allow_uninstall: bool,
+    /// 离线宽限期（天）。
+    ///
+    /// 连续离线超过该天数后，客户端**拒绝解密/受控打开**（仍继续加密，不丢用户数据），
+    /// 用于防止“拔网线永久离线”绕过吊销与审计。`0` = 不限制。
+    #[serde(default)]
+    pub offline_grace_days: u32,
     /// 服务端时间（unix 秒）。
     pub server_time: i64,
 }
@@ -498,12 +504,14 @@ mod tests {
             notice: "本文件已加密".into(),
             classification: "内部".into(),
             allow_uninstall: false,
+            offline_grace_days: 7,
             server_time: 1_800_000_000,
         };
 
         let json = serde_json::to_string(&bundle).expect("序列化成功");
         let back: PolicyBundle = serde_json::from_str(&json).expect("反序列化成功");
         assert_eq!(back, bundle);
+        assert_eq!(back.offline_grace_days, 7);
     }
 
     #[test]

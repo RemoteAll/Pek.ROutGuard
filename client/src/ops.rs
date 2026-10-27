@@ -128,7 +128,13 @@ pub fn encrypt_file(state: &ClientState, path: &Path) -> Result<EncryptOutcome, 
 }
 
 /// 解密容器到指定目录（按容器头记录的规则集取密钥）。
+///
+/// **离线兜底**：连续离线超过服务端下发的宽限期后拒绝解密（防止拔网线长期离线绕过吊销）；
+/// 自动加密路径不经过本函数，离线时照样保护文件。
 pub fn decrypt_file(state: &ClientState, path: &Path, out_dir: &Path) -> Result<PathBuf, String> {
+    if let Some(reason) = state.offline_block_reason(chrono::Utc::now().timestamp()) {
+        return Err(reason);
+    }
     let file = std::fs::File::open(path).map_err(|e| format!("打开容器失败：{e}"))?;
     let mut reader = std::io::BufReader::new(file);
     let header = container::read_header(&mut reader).map_err(|e| format!("读取容器头失败：{e}"))?;
@@ -236,6 +242,7 @@ mod tests {
             notice: "本文件已加密".into(),
             classification: "内部".into(),
             allow_uninstall: false,
+            offline_grace_days: 0,
             server_time: 0,
         };
         ClientState {
@@ -281,6 +288,39 @@ mod tests {
         let state = state_with_policy("0011223344556677");
         let err = encrypt_file(&state, &source).expect_err("txt 不该被加密");
         assert!(err.contains("不加密"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offline_beyond_grace_denies_decrypt_but_still_encrypts() {
+        let dir = temp_dir("offline");
+        let state = state_with_policy("0011223344556677");
+
+        // 正常联网状态：加密 → 解密可用。
+        let first = dir.join("合同.docx");
+        std::fs::write(&first, b"outguard offline").expect("写文件");
+        let container_path = encrypt_file(&state, &first).expect("加密成功").output;
+
+        // 模拟“拔网线 30 天未上报”，且服务端下发的宽限为 7 天。
+        let mut offline = state.clone();
+        offline.last_online = chrono::Utc::now().timestamp() - 30 * 86_400;
+        if let Some(bundle) = offline.policy.as_mut() {
+            bundle.offline_grace_days = 7;
+        }
+
+        // 解密被拒，原因明确指出离线天数与宽限。
+        let err = decrypt_file(&offline, &container_path, &dir.join("out"))
+            .expect_err("超宽限必须拒绝解密");
+        assert!(err.contains("离线 30 天"), "{err}");
+        assert!(err.contains("7 天宽限"), "{err}");
+
+        // 但自动加密不受影响：断网期间新文件照样要被保护。
+        let second = dir.join("离线新建.docx");
+        std::fs::write(&second, b"offline write").expect("写文件");
+        let outcome = encrypt_file(&offline, &second).expect("离线仍必须加密");
+        assert!(outcome.output.exists());
+        assert!(!second.exists());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -29,6 +29,8 @@ const TICK: Duration = Duration::from_secs(30);
 const DEBOUNCE: Duration = Duration::from_millis(800);
 /// 本地事件队列上限（超出丢弃最旧，防磁盘/内存膨胀）。
 const MAX_PENDING_EVENTS: usize = 5000;
+/// 恢复在线时要记日志的最小离线时长（1 分钟）：低于此值视为网络抶动，不刷日志。
+const ONLINE_RESUME_LOG_SECS: i64 = 60;
 
 /// 请求停止运行循环。
 pub fn request_stop() {
@@ -36,17 +38,33 @@ pub fn request_stop() {
 }
 
 /// 运行客户端（前台或服务模式共用）。
+///
+/// **离线优先（硬要求）**：服务端不可达时**绝不退出**，用 `Data/state.json` 里缓存的
+/// 策略与密钥继续保护——该加密的照常加密（不丢用户数据），离线期间的审计事件留在本地队列；
+/// 一旦恢复连接，主循环自动补注册 / 补同步 / 补传事件。
+/// 只有「解密 / 受控打开」在**超过服务端下发的离线宽限期**后拒绝（防止拔网线永久离线绕过吊销）。
 pub fn run(base: &Path) -> Result<(), String> {
     STOP.store(false, Ordering::SeqCst);
     let section = config::load(base).value().client.clone();
     let api = Api::new(&section.server_url)?;
     let mut initial = state::load(base);
 
-    if initial.client_id.is_empty() {
-        register(base, &section, &api, &mut initial)?;
-    }
-    if let Err(e) = sync_policy(base, &api, &mut initial) {
-        dhrust::warn!("首次策略同步失败（将使用本地缓存）：{e}");
+    // 在线准备是非致命步骤：失败即进入离线模式，不影响后续监控与加密。
+    if let Err(e) = prepare_online(base, &section, &api, &mut initial) {
+        let cached = initial.policy.is_some();
+        dhrust::warn!(
+            "离线启动：{e}\n  本地策略缓存：{}；{}",
+            if cached {
+                format!("有（version={}）", initial.policy_version)
+            } else {
+                "无".to_string()
+            },
+            if cached {
+                "已用缓存策略继续保护，联网后自动同步"
+            } else {
+                "尚无缓存策略：联网同步后自动启用加密"
+            }
+        );
     }
 
     let shared = Arc::new(Mutex::new(initial));
@@ -61,35 +79,191 @@ pub fn run(base: &Path) -> Result<(), String> {
         }
         tick += 1;
 
+        // ① 事件上报：失败保留本地队列（离线期间的审计不丢，联网后按 200 条/批补传）。
         if let Err(e) = flush_events(&api, &shared) {
-            dhrust::warn!("事件上报失败（保留本地队列）：{e}");
+            dhrust::warn!("事件上报失败（已保留本地队列，联网后补传）：{e}");
         }
 
+        // ② 心跳（每 60 s）：兼任「在线探测」与「策略版本比对」。
         if tick.is_multiple_of(2) {
             match heartbeat(&api, &shared) {
                 Ok(remote_version) => {
-                    let local = shared.lock().map(|state| state.policy_version).unwrap_or(0);
-                    if remote_version != local {
-                        dhrust::info!("策略版本变化：{local} → {remote_version}");
-                        match sync_policy_from_shared(base, &api, &shared) {
-                            Ok(new_roots) if new_roots != current_roots => {
-                                dhrust::info!("监控根变化，重启文件监控");
-                                watcher = start_watch(base, Arc::clone(&shared))?;
-                                current_roots = roots_of(&watcher);
-                            }
-                            Ok(_) => {}
-                            Err(e) => dhrust::warn!("策略同步失败：{e}"),
+                    mark_online(base, &shared);
+                    let (local_version, has_policy) = {
+                        let state = shared.lock().map_err(|_| "状态锁不可用".to_string())?;
+                        (state.policy_version, state.policy.is_some())
+                    };
+                    if remote_version != local_version || !has_policy {
+                        dhrust::info!("策略需要同步：本地 v{local_version} → 服务端 v{remote_version}");
+                        if let Err(e) = sync_policy_from_shared(base, &api, &shared) {
+                            dhrust::warn!("策略同步失败（继续用本地缓存）：{e}");
                         }
                     }
                 }
-                Err(e) => dhrust::warn!("心跳失败：{e}"),
+                Err(e) => dhrust::warn!("心跳失败（离线运行，下轮自动重试）：{e}"),
             }
+
+            // 首次安装时断网（尚未注册）：每轮重试注册，联网后立即补齐身份与策略。
+            retry_register_if_needed(base, &section, &api, &shared);
         }
+
+        // ③ 让文件监控与「当前生效策略的 WatchRoots」保持一致：
+        //    覆盖「离线补同步后才有根」与「策略取消监控根」两种转换（只在变化时重建）。
+        if let Err(e) = reconcile_watch(base, &shared, &mut watcher, &mut current_roots) {
+            dhrust::warn!("重建文件监控失败（下轮重试）：{e}");
+        }
+
+        // ④ 离线超期检查（纯内存计算，无 IO）。
+        check_offline(&shared);
     }
 
     drop(watcher);
     dhrust::info!("客户端运行循环已退出");
     Ok(())
+}
+
+/// 让监控与「策略要求的根」对齐：变化（含无→有、有→无）才重建，否则零动作。
+fn reconcile_watch(
+    base: &Path,
+    shared: &Arc<Mutex<ClientState>>,
+    watcher: &mut Option<WatchHandle>,
+    current_roots: &mut Vec<String>,
+) -> Result<(), String> {
+    let desired: Vec<String> = {
+        let Ok(state) = shared.lock() else {
+            return Ok(());
+        };
+        state
+            .policy
+            .as_ref()
+            .map(|bundle| bundle.watch_roots.clone())
+            .unwrap_or_default()
+            // 与 `start_watch` 同口径：只保留真实存在的目录，避免反复重建。
+            .into_iter()
+            .filter(|path| Path::new(path).is_dir())
+            .collect()
+    };
+    if desired == *current_roots {
+        return Ok(());
+    }
+    dhrust::info!("监控根变化：{:?} → {desired:?}", *current_roots);
+    *watcher = start_watch(base, Arc::clone(shared))?;
+    *current_roots = roots_of(watcher);
+    Ok(())
+}
+
+/// 在线准备：注册（如需）+ 同步策略。失败即视为离线，由调用方降级处理。
+fn prepare_online(
+    base: &Path,
+    section: &ClientSection,
+    api: &Api,
+    state: &mut ClientState,
+) -> Result<(), String> {
+    if state.client_id.is_empty() {
+        register(base, section, api, state)?;
+    }
+    sync_policy(base, api, state)?;
+    Ok(())
+}
+
+/// 标记「刚刚与服务器通信成功」；顺带清零离线告警标记。
+///
+/// 落盘节流：事件队列短时每 60 s 落一次（state.json 只有几 KB）；
+/// 队列较长（离线堆积）时跳过，等事件补传完再落，避免每分钟写上百 KB。
+fn mark_online(base: &Path, shared: &Arc<Mutex<ClientState>>) {
+    let Ok(mut state) = shared.lock() else {
+        return;
+    };
+    let now = chrono::Utc::now().timestamp();
+    // 只在“离线 → 在线”状态变化时记一笔（不每次心跳刷日志）。
+    if state.last_online > 0 {
+        let gap = (now - state.last_online).max(0);
+        if gap > ONLINE_RESUME_LOG_SECS {
+            dhrust::info!(
+                "网络已恢复：与服务器通信成功（已离线 {} 分钟），开始补同步与补传事件",
+                gap / 60
+            );
+        }
+    }
+    state.last_online = now;
+    state.offline_reported = false;
+    if state.pending_events.len() <= 200
+        && let Err(e) = state::save(base, &state)
+    {
+        dhrust::warn!("在线状态落盘失败（不影响运行）：{e}");
+    }
+}
+
+/// 未注册时的重试（首次安装即断网的场景）。成功后立刻补同步策略。
+fn retry_register_if_needed(
+    base: &Path,
+    section: &ClientSection,
+    api: &Api,
+    shared: &Arc<Mutex<ClientState>>,
+) {
+    let mut snapshot = {
+        let Ok(state) = shared.lock() else {
+            return;
+        };
+        if !state.client_id.is_empty() {
+            return;
+        }
+        state.clone()
+    };
+    match register(base, section, api, &mut snapshot) {
+        Ok(()) => {
+            if let Ok(mut state) = shared.lock() {
+                *state = snapshot;
+            }
+            dhrust::info!("终端注册成功（联网已恢复），立即同步策略");
+            match sync_policy_from_shared(base, api, shared) {
+                Ok(_) => {
+                    mark_online(base, shared);
+                }
+                Err(e) => dhrust::warn!("注册成功但策略同步失败（下轮重试）：{e}"),
+            }
+        }
+        Err(e) => dhrust::warn!("终端注册重试失败（保持离线，规则继续用本地缓存）：{e}"),
+    }
+}
+
+/// 离线超期检查：首次超期时上报一条审计事件（避免每轮重复）。
+fn check_offline(shared: &Arc<Mutex<ClientState>>) {
+    let now = chrono::Utc::now().timestamp();
+    let (exceeded, reported, days, grace) = {
+        let Ok(state) = shared.lock() else {
+            return;
+        };
+        (
+            state.offline_exceeded(now),
+            state.offline_reported,
+            state.offline_days(now),
+            state.offline_grace_days(),
+        )
+    };
+    if !exceeded || reported {
+        return;
+    }
+    dhrust::warn!(
+        "离线超期：已离线 {days} 天 > 宽限 {grace} 天，解密/受控打开已拒绝（自动加密继续，用户数据不丢）"
+    );
+    push_event(
+        shared,
+        ClientEvent {
+            event_id: dhrust::random::hex(8),
+            event_type: EventType::Offline,
+            occurred_at: chrono::Utc::now().timestamp_millis(),
+            path: None,
+            rule_id: None,
+            user: Some(dhrust::sys::machine::user_name()),
+            process_name: None,
+            size: None,
+            detail: Some(format!("离线 {days} 天，宽限 {grace} 天")),
+        },
+    );
+    if let Ok(mut state) = shared.lock() {
+        state.offline_reported = true;
+    }
 }
 
 /// 设备种子（hex）→ Ed25519 密钥。
@@ -190,6 +364,9 @@ fn sync_policy(
     state.policy = Some(bundle);
     state.last_sync = now_text();
     state.status = "active".into();
+    // 同步成功即证明在线：刷新离线基准，解除离线告警。
+    state.last_online = chrono::Utc::now().timestamp();
+    state.offline_reported = false;
     state::save(base, state)?;
     dhrust::info!(
         "策略已同步：version={} 监控根={}",

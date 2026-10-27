@@ -295,6 +295,7 @@ pub fn build_policy_bundle(app: &App, client_token: &str) -> Result<PolicyBundle
         notice: server.notice.clone(),
         classification: server.classification.clone(),
         allow_uninstall: server.allow_uninstall,
+        offline_grace_days: server.offline_grace_days,
         server_time: now_secs(),
     })
 }

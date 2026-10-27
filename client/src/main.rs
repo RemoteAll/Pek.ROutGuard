@@ -144,6 +144,33 @@ fn status_command(base: &Path) -> u8 {
         }
     );
     println!("待上报事件：{}", state.pending_events.len());
+
+    // 离线状态：本地缓存策略照常生效，超宽限才拒绝解密。
+    let now = chrono::Utc::now().timestamp();
+    let offline_secs = state.offline_secs(now);
+    let offline_days = state.offline_days(now);
+    let grace = state.offline_grace_days();
+    println!(
+        "连接：{}",
+        if offline_secs < 300 {
+            "在线（最近 5 分钟内有通信）".to_string()
+        } else if offline_secs < 86_400 {
+            format!("最近通信 {} 分钟前（离线中，继续用本地缓存策略）", offline_secs / 60)
+        } else {
+            format!("离线约 {offline_days} 天（继续用本地缓存策略）")
+        }
+    );
+    println!(
+        "离线宽限：{}",
+        if grace == 0 {
+            "不限制（服务端未设置）".to_string()
+        } else if state.offline_exceeded(now) {
+            format!("{grace} 天 —— 已超期，解密/受控打开被拒绝（自动加密继续）")
+        } else {
+            format!("{grace} 天（剩余 {} 天）", grace.saturating_sub(offline_days))
+        }
+    );
+
     println!("受控临时目录：{}", config::temp_dir(section).display());
     println!(
         "服务：{}（{}）",

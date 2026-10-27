@@ -33,6 +33,57 @@ pub struct ClientState {
     pub last_heartbeat: String,
     /// 待上报事件
     pub pending_events: Vec<ClientEvent>,
+    /// 最近一次与服务端通信成功的时间（unix 秒；离线判定的基准）
+    pub last_online: i64,
+    /// 是否已上报过“离线超期”事件（避免每轮重复上报）
+    pub offline_reported: bool,
+}
+
+impl ClientState {
+    /// 离线秒数（从未通信过返回 0：那时还没策略，本就无法解密）。
+    pub fn offline_secs(&self, now: i64) -> i64 {
+        if self.last_online <= 0 {
+            0
+        } else {
+            (now - self.last_online).max(0)
+        }
+    }
+
+    /// 离线天数（向上取整，便于展示“离线 3 天”）。
+    pub fn offline_days(&self, now: i64) -> u32 {
+        let secs = self.offline_secs(now);
+        if secs <= 0 {
+            0
+        } else {
+            ((secs + 86_399) / 86_400) as u32
+        }
+    }
+
+    /// 服务端下发的离线宽限天数（`0` / 未同步 = 不限制）。
+    pub fn offline_grace_days(&self) -> u32 {
+        self.policy
+            .as_ref()
+            .map(|bundle| bundle.offline_grace_days)
+            .unwrap_or(0)
+    }
+
+    /// 是否已超过离线宽限（超过后拒绝解密/受控打开，仍继续加密）。
+    pub fn offline_exceeded(&self, now: i64) -> bool {
+        let grace = self.offline_grace_days();
+        grace > 0 && self.offline_secs(now) > i64::from(grace) * 86_400
+    }
+
+    /// 离线超期时给用户看的具体原因（用于拒绝提示与审计）。
+    pub fn offline_block_reason(&self, now: i64) -> Option<String> {
+        if !self.offline_exceeded(now) {
+            return None;
+        }
+        Some(format!(
+            "终端已离线 {} 天，超过 {} 天宽限期：为防绕过吊销与审计，已拒绝解密（请接入内网后重试；加密仍正常进行）",
+            self.offline_days(now),
+            self.offline_grace_days()
+        ))
+    }
 }
 
 /// 状态文件路径。
@@ -123,5 +174,73 @@ mod tests {
         let loaded = load(&dir);
         assert!(loaded.client_id.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn bundle_with_grace(days: u32) -> PolicyBundle {
+        PolicyBundle {
+            version: 1,
+            policy_sets: Vec::new(),
+            wrapped_keys: Vec::new(),
+            watch_roots: Vec::new(),
+            exclude_paths: Vec::new(),
+            container_ext: "ogd".into(),
+            company: "示例".into(),
+            notice: "内部资料".into(),
+            classification: "内部".into(),
+            allow_uninstall: false,
+            offline_grace_days: days,
+            server_time: 0,
+        }
+    }
+
+    #[test]
+    fn offline_grace_blocks_only_after_exceeding() {
+        let start = 1_700_000_000i64;
+        let mut state = ClientState {
+            last_online: start,
+            policy: Some(bundle_with_grace(7)),
+            ..Default::default()
+        };
+
+        // 当天：在线，不超期。
+        assert_eq!(state.offline_days(start), 0);
+        assert!(!state.offline_exceeded(start));
+        assert!(state.offline_block_reason(start).is_none());
+
+        // 离线 3 天多：仍不超期，宽限剩 4 天。
+        let three_days = start + 3 * 86_400 + 60;
+        assert_eq!(state.offline_days(three_days), 4);
+        assert!(!state.offline_exceeded(three_days));
+
+        // 刚好 7 天：边界内（未超过），仍允许解密。
+        assert!(!state.offline_exceeded(start + 7 * 86_400));
+
+        // 超过 7 天：拒绝解密，且原因里带天数与宽限。
+        let nine_days = start + 9 * 86_400;
+        assert!(state.offline_exceeded(nine_days));
+        let reason = state.offline_block_reason(nine_days).expect("应给出原因");
+        assert!(reason.contains("离线 9 天"), "{reason}");
+        assert!(reason.contains("7 天宽限期"), "{reason}");
+        assert!(reason.contains("加密仍正常进行"), "{reason}");
+
+        // 恢复在线（刷新 last_online）后立刻解除。
+        state.last_online = nine_days;
+        assert!(!state.offline_exceeded(nine_days));
+    }
+
+    #[test]
+    fn offline_grace_zero_means_unlimited() {
+        let start = 1_700_000_000i64;
+        let unlimited = ClientState {
+            last_online: start,
+            policy: Some(bundle_with_grace(0)),
+            ..Default::default()
+        };
+        assert!(!unlimited.offline_exceeded(start + 365 * 86_400));
+
+        // 未同步过策略（从未通信）：同样不限制（此时本就无密钥可解）。
+        let fresh = ClientState::default();
+        assert_eq!(fresh.offline_grace_days(), 0);
+        assert!(!fresh.offline_exceeded(i64::MAX / 2));
     }
 }
