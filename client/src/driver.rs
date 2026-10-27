@@ -58,6 +58,13 @@ pub struct DriverStats {
     pub path_prefix_count: u32,
     pub ext_count: u32,
     pub last_hit: [u16; MAX_PATH],
+    // —— M2a：ADS 元数据探测（驱动只读，不改数据）——
+    pub ads_hit: i64,
+    pub ads_absent: i64,
+    pub ads_broken: i64,
+    pub ads_error: i64,
+    pub last_ads_file_id: [u8; 8],
+    pub ads_skipped: i64,
 }
 
 impl Default for DriverStats {
@@ -75,6 +82,12 @@ impl Default for DriverStats {
             path_prefix_count: 0,
             ext_count: 0,
             last_hit: [0u16; MAX_PATH],
+            ads_hit: 0,
+            ads_absent: 0,
+            ads_broken: 0,
+            ads_error: 0,
+            last_ads_file_id: [0u8; 8],
+            ads_skipped: 0,
         }
     }
 }
@@ -84,6 +97,17 @@ impl DriverStats {
     pub fn last_hit_display(&self) -> String {
         let len = self.last_hit.iter().position(|&c| c == 0).unwrap_or(0);
         String::from_utf16_lossy(&self.last_hit[..len])
+    }
+
+    /// 最近一次读到的 file_id（十六进制）；全 0 表示还没读到过
+    pub fn last_file_id_display(&self) -> String {
+        if self.last_ads_file_id.iter().all(|&b| b == 0) {
+            return String::new();
+        }
+        self.last_ads_file_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 }
 
@@ -303,8 +327,9 @@ mod tests {
 
     #[test]
     fn stats_layout_matches_driver() {
-        // 驱动侧是 5+3 个 LONGLONG、3 个 ULONG、WCHAR[260]；8 字节对齐后应为 600。
-        assert_eq!(std::mem::size_of::<DriverStats>(), 600, "与驱动 OUG_STATS 不一致");
+        // 驱动侧：5+3 个 LONGLONG(64) + 3 个 ULONG(12) + WCHAR[260](520) = 596 → 对齐 600
+        //        M2a 追加：4 个 LONGLONG(32) + UCHAR[8] + LONGLONG(8) = 48 → 648
+        assert_eq!(std::mem::size_of::<DriverStats>(), 648, "与驱动 OUG_STATS 不一致");
     }
 
     #[test]

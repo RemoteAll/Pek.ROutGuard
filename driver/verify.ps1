@@ -1,4 +1,4 @@
-﻿# Pek.ROutGuard 文件过滤驱动 —— 一键验证（M0 + M1）
+﻿# Pek.ROutGuard 文件过滤驱动 —— 一键验证（M0 + M1 + M2a）
 #
 # 目的：重启并开启测试签名后，**一条命令**就能证明驱动真的在工作，
 #       不用人工一步步敲 fltmc / driver status / 手工建文件。
@@ -6,12 +6,13 @@
 # 验证内容：
 #   1. 环境：测试签名是否开启、服务是否注册、高度是否冲突
 #   2. 加载：fltmc load 是否成功、实例是否挂到卷上
-#   3. 通道：IOCTL 通不通（读版本 0.2）
-#   4. 规则：下发"按扩展名 + 按路径"规则
+#   3. 通道：IOCTL 通不通（读版本 0.3）
+#   4. 规则：下发“按扩展名 + 按路径”规则
 #   5. 判定：在受控目录建文件 → RuleHit / LastHit 是否按预期增长
-#   6. 反证：在受控目录外建文件 → RuleMiss 增长、LastHit 不变
+#   6. 标记：驱动能否区分“已加密”与“无标记”（M2a，只读 :oug 流）
+#   7. 反证 + 收尾：受控目录外不许命中；清空规则；删测试文件
 #
-# M1 阶段驱动**只看不改**：全程不修改任何一个字节，可安全反复运行。
+# M1/M2a 阶段驱动**只看不改**：全程不修改任何一个字节，可安全反复运行。
 #
 # 用法：
 #   .\verify.ps1                      # 完整验证
@@ -84,7 +85,7 @@ function Invoke-Client {
 Write-Host "`n=== Pek.ROutGuard 驱动一键验证 ===`n" -ForegroundColor Cyan
 
 # ————— 1. 环境检查 —————
-Write-Host "[1/6] 环境检查" -ForegroundColor Yellow
+Write-Host "`n[1/7] 环境检查" -ForegroundColor Yellow
 
 # 测试签名
 $signing = & bcdedit /enum '{current}' 2>$null | Out-String
@@ -112,7 +113,7 @@ foreach ($line in ($filters -split "`r?`n")) {
 Add-Result -Name '高度 404900 无冲突' -Ok (-not $altConflict)
 
 # ————— 2. 加载驱动 —————
-Write-Host "`n[2/6] 加载驱动" -ForegroundColor Yellow
+Write-Host "`n[2/7] 加载驱动" -ForegroundColor Yellow
 
 $loaded = $filters -match $serviceName
 if (-not $loaded) {
@@ -136,7 +137,7 @@ $instanceCount = ([regex]::Matches($instances, [regex]::Escape($serviceName))).C
 Add-Result -Name '已挂载到卷' -Ok ($instanceCount -gt 0) -Detail "$instanceCount 个实例"
 
 # ————— 3. 控制通道 —————
-Write-Host "`n[3/6] 控制通道（IOCTL）" -ForegroundColor Yellow
+Write-Host "`n[3/7] 控制通道（IOCTL）" -ForegroundColor Yellow
 
 $exe = Resolve-ClientExe
 if (-not $exe) { Fail-Fast "找不到 pek-outguard-client.exe，请用 -ClientExe 指定路径。" }
@@ -146,10 +147,10 @@ $statusOut = Invoke-Client -Exe $exe -Arguments @('driver', 'status')
 $versionOk = $statusOut -match '版本\s*[:：]?\s*(\d+)\.(\d+)'
 $driverVersion = if ($versionOk) { "$($Matches[1]).$($Matches[2])" } else { '' }
 Add-Result -Name '驱动设备可打开' -Ok ($versionOk -or $statusOut -notmatch '打开驱动设备失败') -Detail $(if ($driverVersion) { "版本 $driverVersion" } else { '' })
-Add-Result -Name '版本为 0.2（含 M1 规则判定）' -Ok ($driverVersion -eq '0.2') -Detail $driverVersion
+Add-Result -Name '版本为 0.3（含 M2a 标记探测）' -Ok ($driverVersion -eq '0.3') -Detail $driverVersion
 
 # ————— 4. 下发规则 —————
-Write-Host "`n[4/6] 下发规则" -ForegroundColor Yellow
+Write-Host "`n[4/7] 下发规则" -ForegroundColor Yellow
 
 if (-not $TestDir) {
     $TestDir = Join-Path $env:TEMP 'oug-driver-verify'
@@ -166,7 +167,7 @@ $rulesOk = $rulesOut -notmatch '失败|错误|error' -and $rulesOut -match '规�
 Add-Result -Name '规则下发成功' -Ok $rulesOk -Detail ($rulesOut.Trim() -split "`r?`n" | Select-Object -First 1)
 
 # ————— 5. 判定命中 —————
-Write-Host "`n[5/6] 规则判定（受控目录内建文件）" -ForegroundColor Yellow
+Write-Host "`n[5/7] 规则判定（受控目录内建文件）" -ForegroundColor Yellow
 
 function Get-DriverStatus {
     param([string]$Exe)
@@ -175,8 +176,10 @@ function Get-DriverStatus {
     # 用英文键名解析：避免“命中”/“未命中”互相误匹配
     if ($out -match 'RuleHit=(\d+)')       { $stats.RuleHit = [int]$Matches[1] }
     if ($out -match 'RuleMiss=(\d+)')      { $stats.RuleMiss = [int]$Matches[1] }
-    if ($out -match 'RuleEvalError=(\d+)') { $stats.RuleEvalError = [int]$Matches[1] }
-    $stats.Raw = $out
+    if ($out -match 'RuleEvalError=(\d+)') { $stats.RuleEvalError = [int]$Matches[1] }    # M2a：缺字段时置 -1，让断言直接失败（说明驱动版本不对）
+    foreach ($key in @('AdsHit', 'AdsAbsent', 'AdsBroken', 'AdsError')) {
+        if ($out -match "$key=(\d+)") { $stats[$key] = [int]$Matches[1] } else { $stats[$key] = -1 }
+    }    $stats.Raw = $out
     return $stats
 }
 
@@ -204,8 +207,35 @@ $extraHit = $third.RuleHit - $after.RuleHit
 $missDelta = $third.RuleMiss - $after.RuleMiss
 Add-Result -Name '目录外不误命中' -Ok ($extraHit -eq 0 -and $missDelta -ge 0) -Detail "受控目录外又命中 $extraHit 次（应为 0）"
 
-# ————— 6. 收尾 —————
-Write-Host "`n[6/6] 收尾" -ForegroundColor Yellow
+# ————— 6. 加密标记探测（M2a）—————
+Write-Host "`n[6/7] 加密标记探测（M2a：驱动只读 :oug 流）" -ForegroundColor Yellow
+
+# 造两个样本：一个带有效加密标记、一个纯明文
+$keyHex = -join (0..63 | ForEach-Object { $_.ToString('x2') })   # 固定测试密钥
+$encSample = Join-Path $TestDir '已加密样本.ougtest'
+$plainSample = Join-Path $TestDir '明文样本.ougtest'
+[System.IO.File]::WriteAllText($encSample, ('A' * 200), (New-Object System.Text.UTF8Encoding($false)))
+[System.IO.File]::WriteAllText($plainSample, ('B' * 200), (New-Object System.Text.UTF8Encoding($false)))
+
+$encOut = Invoke-Client -Exe $exe -Arguments @('rescue', 'encrypt', $encSample, '--key-hex', $keyHex)
+Add-Result -Name '加密样本已加标记' -Ok ($encOut -match '已加密') -Detail ($encOut.Trim() -split "`r?`n" | Select-Object -First 1)
+
+# 统计清零，确保接下来的计数只反映本次探测
+Invoke-Client -Exe $exe -Arguments @('driver', 'reset') | Out-Null
+Start-Sleep -Milliseconds 300
+
+# 各读一次（产生 Create → 触发规则命中 → 驱动读 :oug）
+[System.IO.File]::ReadAllBytes($encSample) | Out-Null
+[System.IO.File]::ReadAllBytes($plainSample) | Out-Null
+Start-Sleep -Milliseconds 600
+
+$ads = Get-DriverStatus -Exe $exe
+Add-Result -Name '已加密文件被识别（AdsHit ≥ 1）' -Ok (($ads['AdsHit']) -ge 1) -Detail "AdsHit=$($ads['AdsHit'])"
+Add-Result -Name '明文文件被识别为无标记（AdsAbsent ≥ 1）' -Ok (($ads['AdsAbsent']) -ge 1) -Detail "AdsAbsent=$($ads['AdsAbsent'])"
+Add-Result -Name '无标记损坏误报（AdsBroken = 0）' -Ok (($ads['AdsBroken']) -eq 0) -Detail "AdsBroken=$($ads['AdsBroken'])"
+
+# ————— 7. 收尾 —————
+Write-Host "`n[7/7] 收尾" -ForegroundColor Yellow
 
 # 复位规则，避免验证规则残留在生产环境
 $resetOut = Invoke-Client -Exe $exe -Arguments @('driver', 'rules', '--clear')

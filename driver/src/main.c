@@ -14,6 +14,8 @@ Pek.ROutGuard 文件过滤驱动 —— M1（规则判定 + 控制通道，**仍
 
 #include <fltKernel.h>
 #include <ntstrsafe.h>
+/* IoCreateDeviceSecure + SDDL：控制设备必须限制为 SYSTEM/管理员可访问 */
+#include <wdmsec.h>
 
 #define OUG_POOL_TAG        'GdOP'
 
@@ -46,6 +48,13 @@ typedef struct _OUG_STATS {
     ULONG    PathPrefixCount;
     ULONG    ExtCount;
     WCHAR    LastHit[OUG_MAX_PATH]; /* 最近一次命中的 NT 路径（便于排错） */
+    /* —— M2a 新增：ADS 元数据探测（**只读，不改任何数据**）—— */
+    LONGLONG AdsHit;         /* 读到有效加密标记（文件已加密） */
+    LONGLONG AdsAbsent;      /* 没有标记（未加密 / 标记未置加密位） */
+    LONGLONG AdsBroken;      /* 有流但魔数/版本/长度不对（损坏） */
+    LONGLONG AdsError;       /* 打不开/读失败（权限异常、文件被删等真实问题） */
+    UCHAR    LastAdsFileId[8]; /* 最近一次读到的 file_id（XTS tweak 基值） */
+    LONGLONG AdsSkipped;     /* 未探测：IRQL 不合适（分页 I/O）等不可做的情形，**不是错误** */
 } OUG_STATS, *POUG_STATS;
 
 /* 规则集：路径前缀（NT 路径，大小写不敏感）+ 扩展名（含点，如 .DOCX） */
@@ -57,6 +66,9 @@ typedef struct _OUG_RULES {
     WCHAR Extensions[OUG_MAX_EXTS][OUG_MAX_EXT_LEN];
 } OUG_RULES, *POUG_RULES;
 
+/* 只读视图：双缓冲的读侧只用它，编译器会挡住"读侧误改规则" */
+typedef const OUG_RULES *PCOUG_RULES;
+
 static PFLT_FILTER  g_Filter = NULL;
 static PDEVICE_OBJECT g_DeviceObject = NULL;
 static OUG_STATS    g_Stats;
@@ -64,12 +76,34 @@ static volatile LONG g_Enabled = 1;
 
 /* 与用户态 `client/src/driver.rs` 的断言一一对应：
    任何一侧改了结构体，这里编译不过，Rust 那边测试也不过 —— 双保险防“协议悄悄漂移”。 */
-C_ASSERT(sizeof(OUG_STATS) == 600);
+C_ASSERT(sizeof(OUG_STATS) == 648);
 C_ASSERT(sizeof(OUG_RULES) == 9356);
 
-/* 规则表：写入时持锁，读时持锁（临界区极短，只做拷贝/比对） */
-static KSPIN_LOCK  g_RulesLock;
-static OUG_RULES   g_Rules;
+/* ————— M2a：NTFS 备用数据流（ADS）元数据（与 core::meta 严格一致）————— */
+
+#define OUG_META_STREAM          L":oug"   /* 元数据流后缀（主文件大小不变） */
+#define OUG_META_STREAM_CHARS    4          /* L":oug" 的字符数 */
+#define OUG_META_LEN             32         /* 元数据固定 32 字节 */
+#define OUG_META_VERSION         1          /* 格式版本 */
+#define OUG_META_FLAG_ENCRYPTED  0x01       /* 位 0 = 已加密 */
+#define OUG_META_OFF_FLAGS       5          /* flags 字节偏移 */
+#define OUG_META_OFF_FILEID      8          /* file_id 8 字节偏移 */
+
+/* 规则表：**双缓冲无锁读**。
+
+   原实现是“写时持锁 + 回调里持锁做几十次字符串比较”：最坏 48 条规则 × 260 字符，
+   在 DISPATCH_LEVEL 自旋锁内跑几微秒 = 其他 CPU 全部自旋等待，属于性能/稳定性隐患。
+
+   现改为：两块静态缓冲 + 一个原子索引。
+     · 写（IOCTL，很罕见）：先填非当前块 → 全屏障后 `InterlockedExchange` 切换索引；
+     · 读（PreCreate，极热）：一次原子读拿到索引，无锁遍历。
+   切换瞬间可能有单个 I/O 用到上一版规则——与“规则滚动更新”语义一致，可接受；
+   旧缓冲是静态内存、永不释放，所以不存在 use-after-free。*/
+static OUG_RULES      g_RulesBuf[2];
+static volatile LONG  g_RulesIndex = 0;
+
+#define OUG_RULES_CURRENT() \
+    (&g_RulesBuf[InterlockedCompareExchange(&g_RulesIndex, 0, 0) & 1])
 
 static const UNICODE_STRING g_DeviceName  = RTL_CONSTANT_STRING(OUG_DEVICE_NAME);
 static const UNICODE_STRING g_SymlinkName = RTL_CONSTANT_STRING(OUG_SYMLINK_NAME);
@@ -85,7 +119,7 @@ static const UNICODE_STRING g_SymlinkName = RTL_CONSTANT_STRING(OUG_SYMLINK_NAME
 #define OUG_IOCTL_RESET_STATS CTL_CODE(OUG_DEVICE_TYPE, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define OUG_VERSION_MAJOR 0
-#define OUG_VERSION_MINOR 2
+#define OUG_VERSION_MINOR 3
 
 /* ————— 匹配工具（无 CRT，手写大小写不敏感比较）————— */
 
@@ -144,33 +178,178 @@ OugSuffixMatch(
     return TRUE;
 }
 
-/* 调用方需持有 g_RulesLock */
+/* 纯函数，无锁：调用方传入当前规则块（双缓冲保证生命周期） */
 static BOOLEAN
-OugRulesMatchLocked(
+OugRulesMatch(
+    _In_ PCOUG_RULES Rules,
     _In_z_ PCWSTR Path
 )
 {
     ULONG i;
 
-    if (g_Rules.Version == 0) {
+    if (Rules->Version == 0) {
         return FALSE;   /* 规则未下发 → 一律不命中（宁可不加密） */
     }
 
     /* 扩展名：任意一个命中即算命中 */
-    for (i = 0; i < g_Rules.ExtCount && i < OUG_MAX_EXTS; i++) {
-        if (OugSuffixMatch(Path, g_Rules.Extensions[i])) {
+    for (i = 0; i < Rules->ExtCount && i < OUG_MAX_EXTS; i++) {
+        if (OugSuffixMatch(Path, Rules->Extensions[i])) {
             return TRUE;
         }
     }
     /* 路径前缀：命中即算命中（两者是“或”的关系，便于“整个目录全加密”场景） */
-    for (i = 0; i < g_Rules.PathPrefixCount && i < OUG_MAX_PREFIXES; i++) {
-        if (OugPrefixMatch(Path, g_Rules.PathPrefixes[i])) {
+    for (i = 0; i < Rules->PathPrefixCount && i < OUG_MAX_PREFIXES; i++) {
+        if (OugPrefixMatch(Path, Rules->PathPrefixes[i])) {
             return TRUE;
         }
     }
     return FALSE;
 }
+/* ————— M2a：ADS 元数据探测（**只读**，不改任何数据）—————
 
+   目的：命中受控规则的文件，驱动需要知道它"到底加密了没有"以及"它的 file_id 是什么"。
+       file_id 是 XTS tweak 的基值，M2b 的 Read/Write 加解密就靠它。
+       这些信息存在 NTFS 备用数据流 `file:oug` 里（32 字节，主文件大小不变）。
+
+   安全约束（每一条都不能违反）：
+      · 只打开 `FILE_READ_DATA`，**不写、不删、不改属性**；
+      · 任何失败（权限/IRQL/路径过长/文件被独占）只计数，**绝不影响原始 I/O**；
+      · 路径长度不够就跳过，**绝不把截断的路径拿去打开**（会打开错的文件）；
+      · **递归保护靠 FltCreateFileEx2 的 Instance 参数**：把本实例传进去，I/O 就从
+        该实例**下方**发起，根本不会再进入我们自己的 PreCreate。比 IoSetTopLevelIrp
+        干净（WDK 26100 已移除 FLT_TOP_LEVEL_IRP 常量），也不会干扰其他 filter。
+        Instance 为空时直接放弃探测 —— 宁可不探测，也不要冒无限递归的风险。
+
+   性能：每个"命中规则且带有效文件名的 Create"多一次 Create+Read+Close。
+       实测口径见 `driver status` 的 Ads* 计数；若开销偏高，M2b 加 stream handle
+       上下文缓存（同一文件多次 Create 只探测一次）。
+*/
+static VOID
+OugProbeMetaAds(
+    _In_ PFLT_FILTER Filter,
+    _In_ PFLT_INSTANCE Instance,
+    _In_reads_(PathChars) PCWSTR NtPath,
+    _In_ ULONG PathChars
+)
+{
+    NTSTATUS status;
+    WCHAR streamPath[OUG_MAX_PATH + OUG_META_STREAM_CHARS + 2];
+    UNICODE_STRING streamName;
+    OBJECT_ATTRIBUTES objectAttributes;
+    IO_STATUS_BLOCK ioStatus;
+    HANDLE handle = NULL;
+    PFILE_OBJECT fileObject = NULL;
+    UCHAR meta[OUG_META_LEN];
+    LARGE_INTEGER offset;
+    ULONG totalChars;
+
+    /* FltCreateFile / ZwReadFile 都必须在 PASSIVE_LEVEL 发起。
+       PreCreate 偶尔会在 APC_LEVEL 上（分页 I/O 等）—— 那不是错误，
+       只是这次探测做不了，记 AdsSkipped（不要冒充 AdsError 误导运维）。 */
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        InterlockedIncrement64(&g_Stats.AdsSkipped);
+        return;
+    }
+
+    /* 没有实例就无法“从本实例下方发起”，递归风险不可控 → 放弃 */
+    if (Instance == NULL || Filter == NULL) {
+        InterlockedIncrement64(&g_Stats.AdsError);
+        return;
+    }
+
+    if (PathChars == 0 ||
+        PathChars + OUG_META_STREAM_CHARS + 1 > RTL_NUMBER_OF(streamPath)) {
+        /* 路径过长：不截断、不猜，直接放弃（截断会打开到别的文件） */
+        InterlockedIncrement64(&g_Stats.AdsError);
+        return;
+    }
+
+    RtlCopyMemory(streamPath, NtPath, PathChars * sizeof(WCHAR));
+    RtlCopyMemory(streamPath + PathChars, OUG_META_STREAM, OUG_META_STREAM_CHARS * sizeof(WCHAR));
+    totalChars = PathChars + OUG_META_STREAM_CHARS;
+    streamPath[totalChars] = L'\0';
+
+    RtlInitUnicodeString(&streamName, streamPath);
+    InitializeObjectAttributes(
+        &objectAttributes,
+        &streamName,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+        NULL,
+        NULL);
+
+    status = FltCreateFileEx2(
+        Filter,
+        Instance,
+        &handle,
+        &fileObject,
+        FILE_READ_DATA | SYNCHRONIZE,
+        &objectAttributes,
+        &ioStatus,
+        NULL,                                   /* AllocationSize */
+        FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+        NULL,                                   /* EaBuffer */
+        0,                                      /* EaLength */
+        IO_IGNORE_SHARE_ACCESS_CHECK,
+        NULL);                                  /* DriverContext */
+
+    if (!NT_SUCCESS(status)) {
+        if (fileObject != NULL) {
+            ObDereferenceObject(fileObject);
+            fileObject = NULL;
+        }
+        if (status == STATUS_OBJECT_NAME_NOT_FOUND ||
+            status == STATUS_OBJECT_PATH_NOT_FOUND) {
+            /* 没有标记流 —— 最常见的情形（未加密文件） */
+            InterlockedIncrement64(&g_Stats.AdsAbsent);
+        } else if (status == STATUS_REPARSE_POINT_ENCOUNTERED ||
+                   status == STATUS_DELETE_PENDING ||
+                   status == STATUS_FILE_DELETED) {
+            /* 文件正在被删除/重定向：不是错误，也不该算损坏 */
+            InterlockedIncrement64(&g_Stats.AdsAbsent);
+        } else {
+            InterlockedIncrement64(&g_Stats.AdsError);
+        }
+        return;
+    }
+
+    /* 同步句柄：读 32 字节。只读，绝不写。 */
+    offset.QuadPart = 0;
+    RtlZeroMemory(meta, sizeof(meta));
+    status = ZwReadFile(
+        handle, NULL, NULL, NULL, &ioStatus, meta, OUG_META_LEN, &offset, NULL);
+
+    FltClose(handle);
+    if (fileObject != NULL) {
+        ObDereferenceObject(fileObject);
+        fileObject = NULL;
+    }
+
+    if (!NT_SUCCESS(status)) {
+        InterlockedIncrement64(&g_Stats.AdsError);
+        return;
+    }
+
+    /* 长度不足 / 不是我们的魔数 / 版本不认 —— 都算"标记损坏"，绝不猜 */
+    if (ioStatus.Information != OUG_META_LEN ||
+        meta[0] != 'O' || meta[1] != 'G' || meta[2] != 'M' || meta[3] != '1' ||
+        meta[4] != OUG_META_VERSION) {
+        InterlockedIncrement64(&g_Stats.AdsBroken);
+        return;
+    }
+
+    if ((meta[OUG_META_OFF_FLAGS] & OUG_META_FLAG_ENCRYPTED) == 0) {
+        /* 标记在但未置加密位：视为未加密（加密中途失败的残留由用户态清理） */
+        InterlockedIncrement64(&g_Stats.AdsAbsent);
+        return;
+    }
+
+    /* 有效加密标记：记下 file_id 供 M2b 使用 */
+    RtlCopyMemory(g_Stats.LastAdsFileId, meta + OUG_META_OFF_FILEID, sizeof(g_Stats.LastAdsFileId));
+    InterlockedIncrement64(&g_Stats.AdsHit);
+}
 /* ————— 回调 ————— */
 
 FLT_PREOP_CALLBACK_STATUS
@@ -180,26 +359,26 @@ OugPreCreate(
     _Flt_CompletionContext_Outptr_ PVOID* CompletionContext
 )
 {
-    UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(CompletionContext);
 
     PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
+    PCOUG_RULES rules;
     NTSTATUS status;
     BOOLEAN matched = FALSE;
-    KIRQL oldIrql;
+    WCHAR pathBuf[OUG_MAX_PATH];
+    ULONG pathChars = 0;
+    BOOLEAN pathUsable = FALSE;
 
     if (InterlockedCompareExchange(&g_Enabled, 1, 1) == 0) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
     InterlockedIncrement64(&g_Stats.Create);
 
-    /* M1：只判定“是否命中受控规则”，**不做任何数据修改**。
-       规则未下发时直接跳过，避免无谓的取路径开销。 */
-    KeAcquireSpinLock(&g_RulesLock, &oldIrql);
-    status = (g_Rules.Version == 0) ? STATUS_INVALID_DEVICE_STATE : STATUS_SUCCESS;
-    KeReleaseSpinLock(&g_RulesLock, oldIrql);
-
-    if (!NT_SUCCESS(status)) {
+    /* M1：只判定"是否命中受控规则"，**不做任何数据修改**。
+       规则未下发时直接跳过，避免无谓的取路径开销。
+       双缓冲：这里只是一次原子读，**不加锁**（见 g_RulesBuf 的说明）。 */
+    rules = OUG_RULES_CURRENT();
+    if (rules->Version == 0) {
         InterlockedIncrement64(&g_Stats.RuleMiss);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
@@ -214,23 +393,28 @@ OugPreCreate(
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
-    KeAcquireSpinLock(&g_RulesLock, &oldIrql);
-    if (g_Rules.Version != 0 && nameInfo->Name.Buffer != NULL) {
+    if (nameInfo->Name.Buffer != NULL) {
         /* Name.Buffer 不是 NUL 结尾，这里按长度拷贝到栈上再比对。 */
-        WCHAR pathBuf[OUG_MAX_PATH];
         ULONG copyChars = nameInfo->Name.Length / sizeof(WCHAR);
         if (copyChars >= OUG_MAX_PATH) {
-            copyChars = OUG_MAX_PATH - 1;
+            /* 路径超长：**不做截断匹配**。截断后的路径可能命中另一条规则，
+               把不该加密的文件判成受控（或反之）—— 属于安全性错误，
+               宁可判为"不命中"。 */
+            InterlockedIncrement64(&g_Stats.RuleEvalError);
+            copyChars = 0;
         }
-        RtlCopyMemory(pathBuf, nameInfo->Name.Buffer, copyChars * sizeof(WCHAR));
-        pathBuf[copyChars] = L'\0';
+        if (copyChars > 0) {
+            RtlCopyMemory(pathBuf, nameInfo->Name.Buffer, copyChars * sizeof(WCHAR));
+            pathBuf[copyChars] = L'\0';
+            pathChars = copyChars;
+            pathUsable = TRUE;
 
-        matched = OugRulesMatchLocked(pathBuf);
-        if (matched) {
-            RtlStringCchCopyW(g_Stats.LastHit, OUG_MAX_PATH, pathBuf);
+            matched = OugRulesMatch(rules, pathBuf);
+            if (matched) {
+                RtlStringCchCopyW(g_Stats.LastHit, OUG_MAX_PATH, pathBuf);
+            }
         }
     }
-    KeReleaseSpinLock(&g_RulesLock, oldIrql);
 
     FltReleaseFileNameInformation(nameInfo);
 
@@ -238,6 +422,12 @@ OugPreCreate(
         InterlockedIncrement64(&g_Stats.RuleHit);
     } else {
         InterlockedIncrement64(&g_Stats.RuleMiss);
+    }
+
+    /* M2a：命中规则 → 读它的加密标记（**只读**，为 M2b 的加解密做准备）。
+       放在释放 nameInfo 之后：探测会发起新的 Create，不宜在持有任何资源时做。 */
+    if (matched && pathUsable) {
+        OugProbeMetaAds(g_Filter, FltObjects->Instance, pathBuf, pathChars);
     }
 
     /* M2 起：命中后在这里建立每文件上下文（密钥）并在 Read/Write 上加解密。 */
@@ -444,8 +634,9 @@ OugDeviceControl(
             break;
         }
         POUG_RULES incoming = (POUG_RULES)buffer;
-        ULONG newVersion;
-        KIRQL oldIrql;
+        POUG_RULES target;
+        LONG next;
+        ULONG i;
 
         /* 参数校验：越界的计数一律拒绝，避免匹配时越界读 */
         if (incoming->PathPrefixCount > OUG_MAX_PREFIXES ||
@@ -454,33 +645,66 @@ OugDeviceControl(
             status = STATUS_INVALID_PARAMETER;
             break;
         }
-        newVersion = incoming->Version;
 
-        KeAcquireSpinLock(&g_RulesLock, &oldIrql);
-        RtlCopyMemory(&g_Rules, incoming, sizeof(OUG_RULES));
-        /* 强制 NUL 结尾，防止用户态传进来的字符串没有结尾 */
-        for (ULONG i = 0; i < OUG_MAX_PREFIXES; i++) {
-            g_Rules.PathPrefixes[i][OUG_MAX_PATH - 1] = L'\0';
+        /* 字符串必须以 NUL 结尾且**在有效范围内**。
+           只强行写最后一个字节为 NUL 是不够的：那等于把超长字符串悄悄截断，
+           截断后的路径做前缀匹配可能命中另一条规则（安全性错误）→ 整包拒绝。 */
+        for (i = 0; i < OUG_MAX_PREFIXES; i++) {
+            BOOLEAN terminated = FALSE;
+            ULONG j;
+            for (j = 0; j < OUG_MAX_PATH; j++) {
+                if (incoming->PathPrefixes[i][j] == L'\0') {
+                    terminated = TRUE;
+                    break;
+                }
+            }
+            if (!terminated) {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
         }
-        for (ULONG i = 0; i < OUG_MAX_EXTS; i++) {
-            g_Rules.Extensions[i][OUG_MAX_EXT_LEN - 1] = L'\0';
+        if (!NT_SUCCESS(status)) {
+            break;
         }
-        g_Stats.RulesVersion = newVersion;
-        g_Stats.PathPrefixCount = g_Rules.PathPrefixCount;
-        g_Stats.ExtCount = g_Rules.ExtCount;
-        KeReleaseSpinLock(&g_RulesLock, oldIrql);
+        for (i = 0; i < OUG_MAX_EXTS; i++) {
+            BOOLEAN terminated = FALSE;
+            ULONG j;
+            for (j = 0; j < OUG_MAX_EXT_LEN; j++) {
+                if (incoming->Extensions[i][j] == L'\0') {
+                    terminated = TRUE;
+                    break;
+                }
+            }
+            if (!terminated) {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+        }
+        if (!NT_SUCCESS(status)) {
+            break;
+        }
+
+        /* 双缓冲：填非当前块 → 全屏障切换索引（InterlockedExchange 在 x86 上带全屏障） */
+        next = 1 - (InterlockedCompareExchange(&g_RulesIndex, 0, 0) & 1);
+        target = &g_RulesBuf[next];
+        RtlCopyMemory(target, incoming, sizeof(OUG_RULES));
+        InterlockedExchange(&g_RulesIndex, next);
+
+        g_Stats.RulesVersion = target->Version;
+        g_Stats.PathPrefixCount = target->PathPrefixCount;
+        g_Stats.ExtCount = target->ExtCount;
 
         status = STATUS_SUCCESS;
         outLen = 0;
         DbgPrint("[PekOutGuard] rules updated: v=%lu prefixes=%lu exts=%lu\n",
-                 newVersion, incoming->PathPrefixCount, incoming->ExtCount);
+                 target->Version, target->PathPrefixCount, target->ExtCount);
         break;
     }
 
     case OUG_IOCTL_RESET_STATS:
     {
-        KIRQL oldIrql;
-        KeAcquireSpinLock(&g_RulesLock, &oldIrql);
+        /* 64 位对齐字段的写入在 x64 上是原子的；统计是"快照"语义，
+           偶尔与并发 I/O 撞车导致某项少清一次可接受，不值得为它加锁。 */
         g_Stats.Create = 0;
         g_Stats.Read = 0;
         g_Stats.Write = 0;
@@ -490,7 +714,13 @@ OugDeviceControl(
         g_Stats.RuleMiss = 0;
         g_Stats.RuleEvalError = 0;
         g_Stats.LastHit[0] = L'\0';
-        KeReleaseSpinLock(&g_RulesLock, oldIrql);
+        /* M2a：这五项必须一起清，否则清零后统计看起来"没生效" */
+        g_Stats.AdsHit = 0;
+        g_Stats.AdsAbsent = 0;
+        g_Stats.AdsBroken = 0;
+        g_Stats.AdsError = 0;
+        g_Stats.AdsSkipped = 0;
+        RtlZeroMemory(g_Stats.LastAdsFileId, sizeof(g_Stats.LastAdsFileId));
         status = STATUS_SUCCESS;
         outLen = 0;
         break;
@@ -511,15 +741,29 @@ OugCreateControlDevice(
     _In_ PDRIVER_OBJECT DriverObject
 )
 {
-    NTSTATUS status = IoCreateDevice(
+    /* **安全关键**：控制设备能下发规则、清规则、关判定、读文件路径统计。
+       用 IoCreateDevice 时设备没有显式 DACL（默认允许 Everyone），
+       结果是任何普通用户都能 `driver rules --clear` 把防泄漏关掉、
+       还能读到最近命中的文件路径 —— 对 DLP 产品等于形同虚设。
+
+       SDDL：D:P(A;;GA;;;SY)(A;;GA;;;BA)
+         D:P           DACL，受保护（不继承父目录的宽松权限）
+         A;;GA;;;SY   允许 SYSTEM 完全访问
+         A;;GA;;;BA   允许 Administrators 完全访问
+       其余身份一律无权打开。 */
+    static const UNICODE_STRING sddl = RTL_CONSTANT_STRING(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+    NTSTATUS status = IoCreateDeviceSecure(
         DriverObject,
         0,
         (PUNICODE_STRING)&g_DeviceName,
         FILE_DEVICE_UNKNOWN,
         FILE_DEVICE_SECURE_OPEN,
         FALSE,
+        &sddl,
+        NULL,                      /* DeviceClassGuid：不指定具体安装类 */
         &g_DeviceObject);
     if (!NT_SUCCESS(status)) {
+        DbgPrint("[PekOutGuard] IoCreateDeviceSecure failed: 0x%08X\n", status);
         return status;
     }
 
@@ -580,10 +824,10 @@ DriverEntry(
 
     DbgPrint("[PekOutGuard] DriverEntry begin\n");
 
-    KeInitializeSpinLock(&g_RulesLock);
-    RtlZeroMemory(&g_Rules, sizeof(g_Rules));
+    /* 规则双缓冲：两块都清零 + 索引归零（Version=0 ⇒ 未下发 ⇒ 一律不命中） */
+    RtlZeroMemory(g_RulesBuf, sizeof(g_RulesBuf));
+    InterlockedExchange(&g_RulesIndex, 0);
     RtlZeroMemory(&g_Stats, sizeof(g_Stats));
-
     /* minifilter 的卸载走 FilterUnloadCallback，不需要 DriverObject->DriverUnload。 */
     status = OugCreateControlDevice(DriverObject);
     if (!NT_SUCCESS(status)) {

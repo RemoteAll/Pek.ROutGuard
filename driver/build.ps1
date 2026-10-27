@@ -106,10 +106,34 @@ $linkArgs = @(
     "/LIBPATH:`"$msvcPath\lib\x64`"",
     "/OUT:`"$sys`"",
     "`"$obj`"",
-    'ntoskrnl.lib', 'fltMgr.lib'
+    'ntoskrnl.lib', 'fltMgr.lib', 'wdmsec.lib', 'BufferOverflowK.lib'
 )
 & "$msvcPath\bin\Hostx64\x64\link.exe" @linkArgs
 if ($LASTEXITCODE -ne 0) { throw "链接失败（link.exe 退出码 $LASTEXITCODE）" }
+
+# ————— 自动签名 —————
+# 改了代码就必须重签，否则签名失效、加载被拒（0xC0000428）。
+# 这里自动用本机的开发证书签；没有证书只警告（不阻塞构建，便于 CI 只做编译检查）。
+$cert = Get-ChildItem 'Cert:\LocalMachine\My' -ErrorAction SilentlyContinue |
+    Where-Object { $_.Subject -like '*PekOutGuard Dev Test*' } |
+    Sort-Object NotAfter -Descending |
+    Select-Object -First 1
+if ($null -eq $cert) {
+    Write-Host "[build] 警告：未找到开发证书 CN=PekOutGuard Dev Test，跳过签名（驱动将无法加载）" -ForegroundColor Yellow
+    Write-Host "[build]   创建：New-SelfSignedCertificate -Subject 'CN=PekOutGuard Dev Test' -Type CodeSigningCert -CertStoreLocation Cert:\LocalMachine\My" -ForegroundColor DarkGray
+} else {
+    $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe' -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1
+    if ($null -eq $signtool) {
+        Write-Host "[build] 警告：未找到 signtool.exe，跳过签名" -ForegroundColor Yellow
+    } else {
+        Write-Host "[build] 签名（$($cert.Thumbprint)）..."
+        & $signtool.FullName sign /fd sha256 /sm /s My /sha1 $cert.Thumbprint $sys | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "签名失败（signtool 退出码 $LASTEXITCODE）" }
+        Write-Host "[build] 签名完成" -ForegroundColor Green
+    }
+}
 
 $file = Get-Item $sys
 Write-Host ""
