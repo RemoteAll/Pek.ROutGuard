@@ -105,7 +105,9 @@ fn print_help() {
          \x20 pek-outguard-client rescue encrypt <file>  【离线】原地加密一个文件（写 :oug 标记）\
          \x20 pek-outguard-client rescue decrypt <file> --out DIR [--key-hex HEX]\
          \x20     \x20  【离线救援】解出明文到 DIR，不动原件；驱动坏了也能救\
-         \x20 pek-outguard-client rescue verify <file>   体检：能否完整解密\n\
+         \x20 pek-outguard-client rescue verify <file>   体检：能否完整解密\
+         \x20 pek-outguard-client rescue scan <dir> [--ext .docx,.xlsx] [--deep]\
+         \x20     \x20  批量体检：统计已加密/无标记/异常文件（--deep 逐文件完整解密）\n\
          \x20 pek-outguard-client mode [show|live --confirm|dry-run]  运行模式（默认演练，不动文件）\n\
          \x20 pek-outguard-client register-assoc        注册 .ogd 关联（双击直接打开，免管理员）\n\
          \x20 pek-outguard-client unregister-assoc      解除 .ogd 关联\n\
@@ -831,7 +833,8 @@ fn rescue_command(base: &Path, args: &[String]) -> u8 {
              \x20 rescue info <file>                              查看透明加密标记\n  \
              \x20 rescue encrypt <file> [--key-hex HEX]           离线原地加密（写 :oug 标记）\n  \
              \x20 rescue decrypt <file> --out DIR [--key-hex HEX] 离线解密，不动原件\n  \
-             \x20 rescue verify <file> [--key-hex HEX]            体检：能否完整解密"
+             \x20 rescue verify <file> [--key-hex HEX]            体检：能否完整解密\n  \
+             \x20 rescue scan <dir> [--ext .docx,.xlsx] [--deep]  批量体检：已加密/无标记/异常"
         );
         return 2;
     };
@@ -840,6 +843,8 @@ fn rescue_command(base: &Path, args: &[String]) -> u8 {
     let mut file: Option<String> = None;
     let mut out_dir: Option<String> = None;
     let mut key_hex: Option<String> = None;
+    let mut ext_filter: Vec<String> = Vec::new();
+    let mut deep = false;
     let mut index = 1usize;
     while index < args.len() {
         match args[index].as_str() {
@@ -850,6 +855,20 @@ fn rescue_command(base: &Path, args: &[String]) -> u8 {
             "--key-hex" => {
                 key_hex = args.get(index + 1).cloned();
                 index += 2;
+            }
+            "--ext" => {
+                if let Some(list) = args.get(index + 1) {
+                    ext_filter = list
+                        .split(',')
+                        .map(|v| v.trim().trim_start_matches('.').to_lowercase())
+                        .filter(|v| !v.is_empty())
+                        .collect();
+                }
+                index += 2;
+            }
+            "--deep" => {
+                deep = true;
+                index += 1;
             }
             other => {
                 file = Some(other.to_string());
@@ -944,10 +963,82 @@ fn rescue_command(base: &Path, args: &[String]) -> u8 {
                 }
             }
         }
+        "scan" => {
+            // 深度校验才需要密钥，纯统计不需要（没密钥也能查泄漏）
+            let cipher = if deep {
+                match rescue_cipher(base, key_hex.as_deref()) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return 1;
+                    }
+                }
+            } else {
+                None
+            };
+            let report = match rescue::scan_tree(Path::new(&file), &ext_filter, cipher.as_ref()) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("扫描失败：{e}");
+                    return 1;
+                }
+            };
+            println!("扫描：{file}");
+            if !ext_filter.is_empty() {
+                println!("  扩展名过滤：{}", ext_filter.join(", "));
+            }
+            println!(
+                "  文件总数 {}：已加密 {}（{:.1}%）、无标记 {}（{:.1}%）、异常 {}",
+                report.total,
+                report.encrypted,
+                pct(report.encrypted, report.total),
+                report.plaintext,
+                pct(report.plaintext, report.total),
+                report.broken.len()
+            );
+            if report.skipped_dirs > 0 {
+                println!("  跳过目录（系统/符号链接）：{}", report.skipped_dirs);
+            }
+            if !report.broken.is_empty() {
+                println!("\n  ⚠ 异常文件（需人工处理）：");
+                for (path, why) in report.broken.iter().take(20) {
+                    println!("    {} —— {why}", path.display());
+                }
+                if report.broken.len() > 20 {
+                    println!("    ……共 {} 个", report.broken.len());
+                }
+            }
+            if !report.plaintext_samples.is_empty() {
+                println!("\n  无标记文件示例（是不是该加密没加密？）：");
+                for path in &report.plaintext_samples {
+                    println!("    {}", path.display());
+                }
+            }
+            if !report.errors.is_empty() {
+                println!("\n  读取错误 {} 条（可能权限不足）：", report.errors.len());
+                for (path, why) in report.errors.iter().take(10) {
+                    println!("    {} —— {why}", path.display());
+                }
+            }
+            if report.broken.is_empty() {
+                0
+            } else {
+                1
+            }
+        }
         other => {
-            eprintln!("未知 rescue 子命令：{other}（可用 info / encrypt / decrypt / verify）");
+            eprintln!("未知 rescue 子命令：{other}（可用 info / encrypt / decrypt / verify / scan）");
             2
         }
+    }
+}
+
+/// 百分比（总数为 0 时返回 0）。
+fn pct(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        part as f64 * 100.0 / total as f64
     }
 }
 
@@ -1016,7 +1107,15 @@ fn driver_command(args: &[String]) -> u8 {
                     println!("  SetInfo={}  Cleanup={}", stats.set_info, stats.cleanup);
                     println!();
                     println!("规则判定：");
-                    println!("  命中={}  未命中={}  取路径失败={}", stats.rule_hit, stats.rule_miss, stats.rule_eval_error);
+                    // 英文键名供脚本/监控解析（中文“命中”会被“未命中”误匹配，不能用中文当键）
+                    println!(
+                        "  RuleHit={}  RuleMiss={}  RuleEvalError={}",
+                        stats.rule_hit, stats.rule_miss, stats.rule_eval_error
+                    );
+                    println!(
+                        "  （命中 {} 次，未命中 {} 次，取路径失败 {} 次）",
+                        stats.rule_hit, stats.rule_miss, stats.rule_eval_error
+                    );
                     let last = stats.last_hit_display();
                     if !last.is_empty() {
                         println!("  最近命中：{last}");
@@ -1031,6 +1130,31 @@ fn driver_command(args: &[String]) -> u8 {
         }
 
         "rules" => {
+            // --clear：下发空规则表（验证脚本收尾用，避免测试规则残留在生产环境）
+            if args.iter().any(|item| item == "--clear") {
+                let client = match open() {
+                    Ok(client) => client,
+                    Err(()) => return 1,
+                };
+                let version = chrono::Local::now().timestamp() as u32;
+                let rules = match driver::DriverRules::new(version, &[], &[]) {
+                    Ok(rules) => rules,
+                    Err(e) => {
+                        eprintln!("构造空规则失败：{e}");
+                        return 1;
+                    }
+                };
+                return match client.set_rules(&rules) {
+                    Ok(()) => {
+                        println!("已清空规则（版本 {version}，0 条路径、 0 条扩展名）——驱动不再做任何判定");
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("清空规则失败：{e}");
+                        1
+                    }
+                };
+            }
             let ext_arg = arg_value(args, "--ext").unwrap_or_default();
             let path_arg = arg_value(args, "--path").unwrap_or_default();
             if ext_arg.trim().is_empty() && path_arg.trim().is_empty() {

@@ -220,6 +220,129 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// 目录体检结果。
+#[derive(Debug, Default)]
+pub struct ScanReport {
+    /// 扫到的文件总数（不含目录）
+    pub total: u64,
+    /// 带有效加密标记的文件数
+    pub encrypted: u64,
+    /// 没有任何标记的文件数
+    pub plaintext: u64,
+    /// 有标记但不可用（校验失败 / 解析失败）的文件
+    pub broken: Vec<(PathBuf, String)>,
+    /// 读取过程中出错的条目（权限不足等，不算文件本身的问题）
+    pub errors: Vec<(PathBuf, String)>,
+    /// 明文文件示例（最多 20 条，供人工判断是不是该加密没加密）
+    pub plaintext_samples: Vec<PathBuf>,
+    /// 跳过的目录数（内部目录/符号链接）
+    pub skipped_dirs: u64,
+}
+
+/// 递归体检一个目录：哪些文件已加密、哪些一个标记都没有、哪些标记坏了。
+///
+/// 驱动崩溃/卸载后运维最先要回答的就是这三个问题，所以这是救援工具的核心子命令。
+///
+/// - `ext_filter` 为空表示不按扩展名过滤；否则只统计这些扩展名（如 `docx`/`xlsx`）。
+/// - `cipher` 为 `Some` 时额外做**深度校验**（每个文件完整解一遍，慢但可靠）。
+pub fn scan_tree(
+    dir: &Path,
+    ext_filter: &[String],
+    cipher: Option<&XtsCipher>,
+) -> Result<ScanReport, String> {
+    if !dir.is_dir() {
+        return Err(format!("{} 不是目录", dir.display()));
+    }
+    let mut report = ScanReport::default();
+    let mut stack = vec![dir.to_path_buf()];
+
+    while let Some(current) = stack.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(e) => {
+                report.errors.push((current.clone(), format!("读取目录失败：{e}")));
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    report.errors.push((current.clone(), format!("目录项读取失败：{e}")));
+                    continue;
+                }
+            };
+            let path = entry.path();
+
+            // 不跟随符号链接/联接点，避免环路
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(e) => {
+                    report.errors.push((path.clone(), format!("取属性失败：{e}")));
+                    continue;
+                }
+            };
+            if meta.file_type().is_symlink() {
+                report.skipped_dirs += 1;
+                continue;
+            }
+            if meta.is_dir() {
+                let name = path.file_name().map(|v| v.to_string_lossy().to_string()).unwrap_or_default();
+                // 自家数据目录与系统垃圾不扫
+                if name == "Data" || name == "System Volume Information" || name == "$RECYCLE.BIN" {
+                    report.skipped_dirs += 1;
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+
+            if !ext_filter.is_empty() {
+                let ext = path
+                    .extension()
+                    .map(|v| v.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                if !ext_filter.iter().any(|want| want.eq_ignore_ascii_case(&ext)) {
+                    continue;
+                }
+            }
+
+            report.total += 1;
+            match ads::read_meta(&path) {
+                Ok(Some(meta)) if meta.is_encrypted() => {
+                    // 深度校验：确认真的能解开（只读，不落盘）
+                    if let Some(cipher) = cipher {
+                        match verify(&path, cipher) {
+                            Ok(_) => report.encrypted += 1,
+                            Err(e) => report.broken.push((path.clone(), e)),
+                        }
+                    } else {
+                        report.encrypted += 1;
+                    }
+                }
+                Ok(Some(_)) => {
+                    // 标记存在但未加密（上次加密中途失败的残留）
+                    report
+                        .broken
+                        .push((path.clone(), "标记存在但未置加密位".to_string()));
+                }
+                Ok(None) => {
+                    report.plaintext += 1;
+                    if report.plaintext_samples.len() < 20 {
+                        report.plaintext_samples.push(path.clone());
+                    }
+                }
+                Err(e) => report.broken.push((path.clone(), e)),
+            }
+        }
+    }
+
+    Ok(report)
+}
+
 /// 从十六进制字符串解析 XTS 密钥（64 字节 = 128 个十六进制字符）。
 pub fn parse_key_hex(text: &str) -> Result<Vec<u8>, String> {
     let cleaned: String = text.chars().filter(|c| !c.is_whitespace()).collect();
@@ -341,5 +464,55 @@ mod tests {
         assert_eq!(key[63], 63);
         assert!(parse_key_hex("abcd").is_err(), "长度不对必须报错");
         assert!(parse_key_hex(&"zz".repeat(64)).is_err(), "非法字符必须报错");
+    }
+
+    #[test]
+    fn scan_tree_classifies_encrypted_plaintext_and_broken() {
+        let dir = temp_dir();
+        // 已加密
+        let enc = dir.join("已加密.docx");
+        std::fs::write(&enc, vec![1u8; 300]).expect("建文件");
+        encrypt_file_in_place(&enc, &cipher()).expect("加密");
+        // 明文
+        let plain = dir.join("明文.docx");
+        std::fs::write(&plain, b"plain").expect("建文件");
+        // 标记损坏
+        let broken = dir.join("损坏.docx");
+        std::fs::write(&broken, b"x").expect("建文件");
+        write_corrupt_meta(&broken);
+        // 子目录里的加密文件（验证递归）
+        let sub = dir.join("子目录");
+        std::fs::create_dir_all(&sub).expect("建子目录");
+        let nested = sub.join("嵌套.xlsx");
+        std::fs::write(&nested, vec![2u8; 100]).expect("建文件");
+        encrypt_file_in_place(&nested, &cipher()).expect("加密");
+        // 其它扩展名（验证过滤）
+        std::fs::write(dir.join("忽略.txt"), b"t").expect("建文件");
+
+        let report = scan_tree(&dir, &["docx".into(), "xlsx".into()], Some(&cipher())).expect("扫描");
+        assert_eq!(report.total, 4, "docx/xlsx 共 4 个（含子目录）");
+        assert_eq!(report.encrypted, 2, "两个加密文件应都能深度校验通过");
+        assert_eq!(report.plaintext, 1, "一个明文文件");
+        assert_eq!(report.broken.len(), 1, "一个损坏标记");
+        assert!(report.broken[0].0.ends_with("损坏.docx"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_tree_rejects_non_directory() {
+        let dir = temp_dir();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, b"x").expect("建文件");
+        let err = scan_tree(&file, &[], None).expect_err("不是目录必须报错");
+        assert!(err.contains("不是目录"), "错误信息应说明原因，实际：{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写一个校验不过的标记（模拟 ADS 被篡改或半截写入）。
+    fn write_corrupt_meta(path: &Path) {
+        let mut bytes = FileMeta::new_random().encode().to_vec();
+        bytes[10] ^= 0xFF;
+        std::fs::write(ads::ads_path(path), &bytes).expect("写坏标记");
     }
 }
