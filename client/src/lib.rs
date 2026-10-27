@@ -11,6 +11,7 @@ pub mod api;
 pub mod assoc;
 pub mod config;
 pub mod driver;
+pub mod index;
 pub mod opensession;
 pub mod ops;
 pub mod projfs;
@@ -20,6 +21,7 @@ pub mod safety;
 pub mod secure_area;
 pub mod service;
 pub mod state;
+pub mod transparent;
 pub mod watch;
 
 use std::path::PathBuf;
@@ -34,6 +36,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 产品名。
 pub const PRODUCT: &str = "Pek.ROutGuard Client";
+
+
 
 
 

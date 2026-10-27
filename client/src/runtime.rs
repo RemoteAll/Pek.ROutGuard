@@ -17,6 +17,7 @@ use pek_outguard_core::signature::DeviceKey;
 
 use crate::api::Api;
 use crate::config::{self, ClientSection};
+use crate::driver;
 use crate::state::{self, ClientState};
 use crate::watch::{self, WatchHandle};
 use crate::{VERSION, opensession, ops, safety, secure_area};
@@ -471,7 +472,80 @@ fn sync_policy(
         state.policy_version,
         roots.len()
     );
+    // 同步成功后把规则与密钥推给内核驱动。
+    // **失败不影响策略同步**：驱动没装/没加载是开发与灰度期的正常状态。
+    match push_to_driver(state) {
+        Ok(note) => dhrust::info!("{note}"),
+        Err(e) => dhrust::debug!("驱动未接入（{e}）；用户态加密流程照常工作"),
+    }
     Ok(roots)
+}
+
+/// 把当前策略的受控路径/扩展名与 XTS 密钥推送给内核驱动。
+///
+/// 安全要点：
+/// - 密钥由 `ops::policy_key` + `crypto::derive_xts_key` 现场派生，**只经 IOCTL 走内存**，
+///   不落盘、不进日志；
+/// - 驱动没加载 / 权限不足时返回 Err，调用方只记日志，绝不中断正常流程。
+fn push_to_driver(state: &ClientState) -> Result<String, String> {
+    use pek_outguard_core::{crypto, rules::Action};
+
+    let bundle = state.policy.as_ref().ok_or("策略未同步")?;
+    let client = driver::DriverClient::open()?;
+
+    // ① 受控路径：watch_roots 换算成内核看到的 NT 路径
+    let mut prefixes = Vec::new();
+    for root in &bundle.watch_roots {
+        match driver::dos_to_nt_path(Path::new(root)) {
+            Ok(nt) => prefixes.push(nt),
+            Err(e) => dhrust::warn!("监控根 {root} 无法换算成 NT 路径，驱动侧跳过：{e}"),
+        }
+    }
+
+    // ② 扩展名：只取"加密"动作且指定了扩展名的规则，去重后交给驱动
+    let mut exts: Vec<String> = Vec::new();
+    for set in &bundle.policy_sets {
+        for rule in &set.rules {
+            if rule.action != Action::Encrypt {
+                continue;
+            }
+            for ext in &rule.extensions {
+                let normalized = if ext.starts_with('.') {
+                    ext.to_lowercase()
+                } else {
+                    format!(".{}", ext.to_lowercase())
+                };
+                if normalized != ".*" && !exts.contains(&normalized) {
+                    exts.push(normalized);
+                }
+            }
+        }
+    }
+
+    if prefixes.is_empty() && exts.is_empty() {
+        return Err("策略里没有可下发的受控路径或扩展名".into());
+    }
+
+    let rules = driver::DriverRules::new(bundle.version.max(1), &prefixes, &exts)?;
+    client.set_rules(&rules)?;
+
+    // ③ 密钥：从策略密钥派生 XTS 密钥（与应用层加密同一把，保证透明加密能解开已加密文件）
+    let mut key_note = "密钥未下发（策略缺少规则集）".to_string();
+    if let Some(set) = bundle.policy_sets.first()
+        && let Ok(policy_key) = ops::policy_key(state, &set.id)
+    {
+        let xts = crypto::derive_xts_key(&policy_key);
+        let request = driver::KeyRequest::new(set.key_version.max(1), &xts)?;
+        match client.set_policy_key(&request) {
+            Ok(()) => key_note = format!("密钥已下发（版本 {}）", set.key_version.max(1)),
+            Err(e) => key_note = format!("密钥下发失败：{e}"),
+        }
+    }
+
+    Ok(format!(
+        "已推送驱动：{} 条路径、{} 个扩展名；{key_note}",
+        rules.path_prefix_count, rules.ext_count
+    ))
 }
 
 fn sync_policy_from_shared(

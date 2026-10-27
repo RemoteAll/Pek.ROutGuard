@@ -35,6 +35,39 @@ const IOCTL_SET_ENABLED: u32 = ctl_code(0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 const IOCTL_GET_VERSION: u32 = ctl_code(0x803, METHOD_BUFFERED, FILE_ANY_ACCESS);
 const IOCTL_SET_RULES: u32 = ctl_code(0x804, METHOD_BUFFERED, FILE_ANY_ACCESS);
 const IOCTL_RESET_STATS: u32 = ctl_code(0x805, METHOD_BUFFERED, FILE_ANY_ACCESS);
+const IOCTL_SET_POLICY_KEY: u32 = ctl_code(0x806, METHOD_BUFFERED, FILE_ANY_ACCESS);
+
+/// XTS 密钥长度（64 字节 = key1 数据密钥 + key2 tweak 密钥）
+pub const XTS_KEY_LEN: usize = 64;
+
+/// 与驱动 `OUG_KEY_REQUEST` 字节级一致。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KeyRequest {
+    pub version: u32,
+    pub key: [u8; XTS_KEY_LEN],
+}
+
+impl std::fmt::Debug for KeyRequest {
+    /// **密钥一律不打印**（凭据不明文落盘 / 不进日志）
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KeyRequest {{ version: {}, key: <已隐藏> }}", self.version)
+    }
+}
+
+impl KeyRequest {
+    pub fn new(version: u32, key: &[u8]) -> Result<Self, String> {
+        if key.len() != XTS_KEY_LEN {
+            return Err(format!("XTS 密钥必须 {XTS_KEY_LEN} 字节，实际 {}", key.len()));
+        }
+        let mut buf = [0u8; XTS_KEY_LEN];
+        buf.copy_from_slice(key);
+        Ok(Self {
+            version,
+            key: buf,
+        })
+    }
+}
 
 /// 规则表上限（必须与驱动 `main.c` 的常量一致）
 pub const MAX_PREFIXES: usize = 16;
@@ -67,6 +100,10 @@ pub struct DriverStats {
     pub ads_skipped: i64,
     /// 魔数/版本合法但 SHA-256 校验和对不上：标记被篗改或写坏了
     pub ads_tampered: i64,
+    /// XTS 密钥版本（0 = 未下发）
+    pub key_version: u32,
+    /// 0=未就绪 1=已就绪 2=下发失败
+    pub key_state: u32,
 }
 
 impl Default for DriverStats {
@@ -91,6 +128,8 @@ impl Default for DriverStats {
             last_ads_file_id: [0u8; 8],
             ads_skipped: 0,
             ads_tampered: 0,
+            key_version: 0,
+            key_state: 0,
         }
     }
 }
@@ -284,6 +323,18 @@ impl DriverClient {
         self.call(IOCTL_RESET_STATS, None, 0)?;
         Ok(())
     }
+
+    /// 下发 XTS 密钥（M2c）。密钥只在内存中传递，不落盘、不进日志。
+    pub fn set_policy_key(&self, request: &KeyRequest) -> Result<(), String> {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                request as *const KeyRequest as *const u8,
+                std::mem::size_of::<KeyRequest>(),
+            )
+        };
+        self.call(IOCTL_SET_POLICY_KEY, Some(bytes), 0)?;
+        Ok(())
+    }
 }
 
 impl Drop for DriverClient {
@@ -332,7 +383,8 @@ mod tests {
     fn stats_layout_matches_driver() {
         // 驱动侧：5+3 个 LONGLONG(64) + 3 个 ULONG(12) + WCHAR[260](520) = 596 → 对齐 600
         //        M2a：4 个 LONGLONG(32) + UCHAR[8] + 2 个 LONGLONG(16) = 56 → 656
-        assert_eq!(std::mem::size_of::<DriverStats>(), 656, "与驱动 OUG_STATS 不一致");
+        //        M2c：2 个 ULONG(8) → 664
+        assert_eq!(std::mem::size_of::<DriverStats>(), 664, "与驱动 OUG_STATS 不一致");
     }
 
     #[test]

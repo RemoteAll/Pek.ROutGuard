@@ -1151,8 +1151,7 @@ fn driver_command(args: &[String]) -> u8 {
 
         "rules" => {
             // --clear：下发空规则表（验证脚本收尾用，避免测试规则残留在生产环境）
-            if args.iter().any(|item| item == "--clear") {
-                let client = match open() {
+            if args.iter().any(|item| item == "--clear") {                let client = match open() {
                     Ok(client) => client,
                     Err(()) => return 1,
                 };
@@ -1247,6 +1246,50 @@ fn driver_command(args: &[String]) -> u8 {
                 }
                 Err(e) => {
                     eprintln!("清零失败：{e}");
+                    1
+                }
+            }
+        }
+
+        "key" => {
+            // M2c：下发 XTS 密钥。密钥只走内存（不落盘、不进日志）。
+            let Some(hex) = arg_value(args, "--key-hex") else {
+                eprintln!("用法：driver key --key-hex <128 个十六进制字符>");
+                eprintln!("说明：这是 XTS 密钥（64 字节）。生产环境应由客户端服务从策略密钥自动派生并下发。");
+                return 2;
+            };
+            let raw = match rescue::parse_key_hex(&hex) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    eprintln!("密钥解析失败：{e}");
+                    return 1;
+                }
+            };
+            let version = args
+                .iter()
+                .position(|item| item == "--version")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or_else(|| chrono::Local::now().timestamp() as u32);
+            let request = match driver::KeyRequest::new(version, &raw) {
+                Ok(request) => request,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return 1;
+                }
+            };
+            let client = match open() {
+                Ok(client) => client,
+                Err(()) => return 1,
+            };
+            match client.set_policy_key(&request) {
+                Ok(()) => {
+                    println!("已下发 XTS 密钥（版本 {version}）—— 密钥只在驱动内存中，不落盘");
+                    println!("注意：当前阶段驱动**仍不做任何加解密**，只验证密钥通道是否可用");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("下发密钥失败：{e}");
                     1
                 }
             }

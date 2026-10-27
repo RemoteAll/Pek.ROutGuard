@@ -57,8 +57,9 @@ typedef struct _OUG_STATS {
     LONGLONG AdsError;       /* 打不开/读失败（权限异常、文件被删等真实问题） */
     UCHAR    LastAdsFileId[8]; /* 最近一次读到的 file_id（XTS tweak 基值） */
     LONGLONG AdsSkipped;     /* 未探测：IRQL 不合适（分页 I/O）等不可做的情形，**不是错误** */
-    LONGLONG AdsTampered;    /* 魔数/版本合法但**校验和对不上**：标记被篡改或写坏了 */
-} OUG_STATS, *POUG_STATS;
+    LONGLONG AdsTampered;    /* 魔数/版本合法但**校验和对不上**：标记被篡改或写坏了 */    /* —— M2c：密钥通道 —— */
+    ULONG    KeyVersion;     /* XTS 密钥版本（0 = 未下发） */
+    ULONG    KeyState;       /* 0=未就绪 1=已就绪（AES 句柄已建） 2=下发失败 */} OUG_STATS, *POUG_STATS;
 
 /* 规则集：路径前缀（NT 路径，大小写不敏感）+ 扩展名（含点，如 .DOCX） */
 typedef struct _OUG_RULES {
@@ -72,6 +73,9 @@ typedef struct _OUG_RULES {
 /* 只读视图：双缓冲的读侧只用它，编译器会挡住"读侧误改规则" */
 typedef const OUG_RULES *PCOUG_RULES;
 
+/* M2c：XTS 密钥长度（64 字节 = key1 数据密钥 + key2 tweak 密钥） */
+#define OUG_XTS_KEY_LEN 64
+
 static PFLT_FILTER  g_Filter = NULL;
 static PDEVICE_OBJECT g_DeviceObject = NULL;
 static OUG_STATS    g_Stats;
@@ -82,9 +86,23 @@ static volatile LONG g_Enabled = 1;
    BCrypt 算法句柄本身是线程安全的，并发时只需各自 CreateHash。 */
 static BCRYPT_ALG_HANDLE g_Sha256Alg = NULL;
 
+/* M2c：XTS 密钥与 AES 句柄。
+
+   安全约束：
+     · 密钥**只存在于非分页/分页内存**，绝不落盘、绝不打印到日志；
+     · 下发入口受 SDDL 保护（仅 SYSTEM/Administrators）；
+     · 卸载时先销毁句柄再清零密钥缓冲；
+     · 旧密钥必须立即核销（用新会话重建环境，避免残留句柄被误用）。 */
+static BCRYPT_ALG_HANDLE g_AesAlg = NULL;   /* AES-256 ECB（XTS 的轮函数底座） */
+static BCRYPT_KEY_HANDLE g_AesKey1 = NULL;  /* 数据密钥 */
+static BCRYPT_KEY_HANDLE g_AesKey2 = NULL;  /* tweak 密钥 */
+static ULONG  g_KeyVersion = 0;             /* 0 = 未下发 */
+static KSPIN_LOCK g_KeyLock;                /* 保护密钥句柄的替换 */
+static UCHAR  g_KeyRaw[OUG_XTS_KEY_LEN];    /* 仅供核销用，不参与运算 */
+
 /* 与用户态 `client/src/driver.rs` 的断言一一对应：
    任何一侧改了结构体，这里编译不过，Rust 那边测试也不过 —— 双保险防“协议悄悄漂移”。 */
-C_ASSERT(sizeof(OUG_STATS) == 656);
+C_ASSERT(sizeof(OUG_STATS) == 664);
 C_ASSERT(sizeof(OUG_RULES) == 9356);
 
 /* ————— M2a：NTFS 备用数据流（ADS）元数据（与 core::meta 严格一致）————— */
@@ -99,6 +117,7 @@ C_ASSERT(sizeof(OUG_RULES) == 9356);
 #define OUG_META_OFF_CHECKSUM    24         /* 校验和 8 字节偏移：SHA-256(bytes[0..24])[0..8] */
 #define OUG_META_CHECKSUM_BYTES  8          /* 只存 SHA-256 前 8 字节 */
 #define OUG_SHA256_LEN           32
+
 
 /* 规则表：**双缓冲无锁读**。
 
@@ -128,6 +147,12 @@ static const UNICODE_STRING g_SymlinkName = RTL_CONSTANT_STRING(OUG_SYMLINK_NAME
 #define OUG_IOCTL_GET_VERSION CTL_CODE(OUG_DEVICE_TYPE, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define OUG_IOCTL_SET_RULES   CTL_CODE(OUG_DEVICE_TYPE, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define OUG_IOCTL_RESET_STATS CTL_CODE(OUG_DEVICE_TYPE, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define OUG_IOCTL_SET_POLICY_KEY CTL_CODE(OUG_DEVICE_TYPE, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+typedef struct _OUG_KEY_REQUEST {
+    ULONG Version;                 /* 非 0；与策略版本对应 */
+    UCHAR Key[OUG_XTS_KEY_LEN];    /* XTS 密钥（仅内存，绝不落盘） */
+} OUG_KEY_REQUEST, *POUG_KEY_REQUEST;
 
 #define OUG_VERSION_MAJOR 0
 #define OUG_VERSION_MINOR 3
@@ -764,6 +789,67 @@ OugDeviceControl(
         break;
     }
 
+    case OUG_IOCTL_SET_POLICY_KEY:
+    {
+        /* M2c：接收 XTS 密钥。只建句柄，**本阶段不参与任何数据变换**。
+           顺序讲究：先在新密钥上建好句柄，全部成功后才切换全局引用，
+           避免"旧的已销毁、新的没建成"导致加密能力凭空消失。 */
+        if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(OUG_KEY_REQUEST)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        POUG_KEY_REQUEST request = (POUG_KEY_REQUEST)buffer;
+        BCRYPT_KEY_HANDLE newKey1 = NULL;
+        BCRYPT_KEY_HANDLE newKey2 = NULL;
+        BCRYPT_KEY_HANDLE oldKey1;
+        BCRYPT_KEY_HANDLE oldKey2;
+        KIRQL keyIrql;
+
+        if (request->Version == 0) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (g_AesAlg == NULL) {
+            /* 算法句柄不可用：记状态，让用户态看到"下发失败"而不是静默成功 */
+            g_Stats.KeyState = 2;
+            status = STATUS_INTERNAL_ERROR;
+            break;
+        }
+
+        status = BCryptGenerateSymmetricKey(
+            g_AesAlg, &newKey1, NULL, 0, request->Key, 32, 0);
+        if (NT_SUCCESS(status)) {
+            status = BCryptGenerateSymmetricKey(
+                g_AesAlg, &newKey2, NULL, 0, request->Key + 32, 32, 0);
+        }
+        if (!NT_SUCCESS(status)) {
+            if (newKey1 != NULL) { BCryptDestroyKey(newKey1); }
+            if (newKey2 != NULL) { BCryptDestroyKey(newKey2); }
+            g_Stats.KeyState = 2;
+            break;
+        }
+
+        KeAcquireSpinLock(&g_KeyLock, &keyIrql);
+        oldKey1 = g_AesKey1;
+        oldKey2 = g_AesKey2;
+        g_AesKey1 = newKey1;
+        g_AesKey2 = newKey2;
+        g_KeyVersion = request->Version;
+        RtlCopyMemory(g_KeyRaw, request->Key, OUG_XTS_KEY_LEN);
+        KeReleaseSpinLock(&g_KeyLock, keyIrql);
+
+        if (oldKey1 != NULL) { BCryptDestroyKey(oldKey1); }
+        if (oldKey2 != NULL) { BCryptDestroyKey(oldKey2); }
+
+        g_Stats.KeyVersion = request->Version;
+        g_Stats.KeyState = 1;
+        status = STATUS_SUCCESS;
+        outLen = 0;
+        /* 只记版本，绝不打印密钥 */
+        DbgPrint("[PekOutGuard] policy key v%lu installed\n", request->Version);
+        break;
+    }
+
     case OUG_IOCTL_RESET_STATS:
     {
         /* 64 位对齐字段的写入在 x64 上是原子的；统计是"快照"语义，
@@ -870,6 +956,21 @@ OugFilterUnload(
         g_Filter = NULL;
     }
     OugDeleteControlDevice();
+    /* 密钥销毁顺序：先销毁 BCrypt 句柄（它们内部可能还引用着密钥材料），
+       再清零我们自己保存的原始密钥缓冲。 */
+    if (g_AesKey1 != NULL) {
+        BCryptDestroyKey(g_AesKey1);
+        g_AesKey1 = NULL;
+    }
+    if (g_AesKey2 != NULL) {
+        BCryptDestroyKey(g_AesKey2);
+        g_AesKey2 = NULL;
+    }
+    RtlSecureZeroMemory(g_KeyRaw, sizeof(g_KeyRaw));
+    if (g_AesAlg != NULL) {
+        BCryptCloseAlgorithmProvider(g_AesAlg, 0);
+        g_AesAlg = NULL;
+    }
     if (g_Sha256Alg != NULL) {
         BCryptCloseAlgorithmProvider(g_Sha256Alg, 0);
         g_Sha256Alg = NULL;
@@ -906,6 +1007,34 @@ DriverEntry(
         g_Sha256Alg = NULL;
         return status;
     }
+
+    /* M2c：AES-256 ECB 算法句柄（XTS 的轮函数底座）。
+       同样：打不开就拒绝加载 —— 没有加密能力却运行，会让用户以为文件被保护了。 */
+    status = BCryptOpenAlgorithmProvider(&g_AesAlg, BCRYPT_AES_ALGORITHM, NULL, 0);
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("[PekOutGuard] BCryptOpenAlgorithmProvider(AES) failed 0x%08X —— 拒绝加载\n", status);
+        g_AesAlg = NULL;
+        BCryptCloseAlgorithmProvider(g_Sha256Alg, 0);
+        g_Sha256Alg = NULL;
+        return status;
+    }
+    status = BCryptSetProperty(
+        g_AesAlg,
+        BCRYPT_CHAINING_MODE,
+        (PUCHAR)BCRYPT_CHAIN_MODE_ECB,
+        sizeof(BCRYPT_CHAIN_MODE_ECB),
+        0);
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("[PekOutGuard] set ECB mode failed 0x%08X —— 拒绝加载\n", status);
+        BCryptCloseAlgorithmProvider(g_AesAlg, 0);
+        g_AesAlg = NULL;
+        BCryptCloseAlgorithmProvider(g_Sha256Alg, 0);
+        g_Sha256Alg = NULL;
+        return status;
+    }
+    KeInitializeSpinLock(&g_KeyLock);
+    g_KeyVersion = 0;
+    g_Stats.KeyState = 0;
     /* minifilter 的卸载走 FilterUnloadCallback，不需要 DriverObject->DriverUnload。 */
     status = OugCreateControlDevice(DriverObject);
     if (!NT_SUCCESS(status)) {
