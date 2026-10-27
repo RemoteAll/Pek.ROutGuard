@@ -969,6 +969,30 @@ fn secure_area_command(base: &Path, args: &[String]) -> u8 {
                 }
             };
             let keep = !args.iter().any(|arg| arg == "--move");
+            if source.is_dir() {
+                // 目录：批量导入（保留相对结构，不覆盖已存在条目）
+                let prefix = arg_value(args, "--as").unwrap_or_default();
+                return match secure_area::import_tree(&options, &key, &source, &prefix, keep) {
+                    Ok(report) => {
+                        println!("{}", report.summary());
+                        for (relative, reason) in &report.failures {
+                            println!("  失败：{relative} —— {reason}");
+                        }
+                        println!(
+                            "安全区 {} 里现在就能看到这些文件（磁盘上只存密文）。",
+                            root.display()
+                        );
+                        if report.failed > 0 {
+                            println!("有 {} 个文件失败，详见日志；源文件未删除。", report.failed);
+                        }
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("批量导入失败：{e}");
+                        1
+                    }
+                };
+            }
             match secure_area::import_file(&options, &key, &source, &relative, keep) {
                 Ok(vault_path) => {
                     println!("已导入：{} → {}", source.display(), vault_path.display());

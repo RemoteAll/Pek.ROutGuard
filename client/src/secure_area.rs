@@ -1141,7 +1141,12 @@ pub fn import_file(
     if relative.trim().is_empty() {
         return Err("目标相对路径不能为空".into());
     }
-    let plain = std::fs::read(source).map_err(|e| format!("读取源文件失败：{e}"))?;
+    // 流式：几百 MB 的图纸也不会把进程撑爆。
+    let plain_size = std::fs::metadata(source)
+        .map_err(|e| format!("读取源文件信息失败：{e}"))?
+        .len();
+    let plain_hash = pek_outguard_core::crypto::sha256_file(source)
+        .map_err(|e| format!("计算源文件哈希失败：{e}"))?;
     let name = Path::new(relative)
         .file_name()
         .map(|value| value.to_string_lossy().to_string())
@@ -1158,10 +1163,8 @@ pub fn import_file(
         client_id: String::new(),
         created_at: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
         original_name: name,
-        original_size: plain.len() as u64,
-        plain_sha256: Some(pek_outguard_core::crypto::hex(
-            &pek_outguard_core::crypto::sha256(&plain),
-        )),
+        original_size: plain_size,
+        plain_sha256: Some(pek_outguard_core::crypto::hex(&plain_hash)),
     };
 
     let vault_path = options
@@ -1172,13 +1175,14 @@ pub fn import_file(
     }
     let temp = vault_path.with_extension(format!("{VAULT_EXT}.tmp"));
     {
-        let mut input = std::io::Cursor::new(&plain);
+        let mut input =
+            std::fs::File::open(source).map_err(|e| format!("打开源文件失败：{e}"))?;
         let mut out = std::fs::File::create(&temp)
             .map_err(|e| format!("创建密文失败（{}）：{e}", temp.display()))?;
         pek_outguard_core::container::encrypt_stream(key, &header, &mut input, &mut out)
             .map_err(|e| format!("加密失败：{e}"))?;
     }
-    std::fs::rename(&temp, &vault_path).map_err(|e| {
+    dhrust::io::safe_replace_file(&temp, &vault_path).map_err(|e| {
         let _ = std::fs::remove_file(&temp);
         format!("落位密文失败：{e}")
     })?;
@@ -1198,9 +1202,133 @@ pub fn import_file(
         );
     }
     if let Some(sink) = &options.audit {
-        (sink)("import", relative, Some(plain.len() as u64));
+        (sink)("import", relative, Some(plain_size));
     }
     Ok(vault_path)
+}
+
+/// 批量导入要跳过的“垃圾文件”。
+///
+/// 办公目录里常见：Office 锁文件 `~$xxx.docx`、系统缩略图 `Thumbs.db`/`desktop.ini`、
+/// 编辑器临时文件 `*.tmp`/`*.bak`、隐藏文件（以 `.` 开头）。这些搬进密文库没有意义，
+/// 还会让用户看到一堆莫名其妙的条目。
+pub fn should_skip_import(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    name.is_empty()
+        || name.starts_with('.')
+        || lower.starts_with("~$")
+        || lower.ends_with(".tmp")
+        || lower.ends_with(".bak")
+        || lower.ends_with(".crdownload")
+        || lower.ends_with(".part")
+        || matches!(lower.as_str(), "thumbs.db" | "desktop.ini" | "$recycle.bin")
+}
+
+/// 批量导入结果。
+#[derive(Debug, Default)]
+pub struct ImportReport {
+    /// 成功导入的文件数
+    pub imported: usize,
+    /// 因目标已存在而跳过的文件数（不覆盖，避免毁掉用户旧版本）
+    pub skipped: usize,
+    /// 因错误失败的文件数
+    pub failed: usize,
+    /// 成功导入的总字节数
+    pub bytes: u64,
+    /// 失败明细（最多保留 20 条，避免刷屏；完整原因已写日志）
+    pub failures: Vec<(String, String)>,
+}
+
+impl ImportReport {
+    /// 一句话摘要（给 CLI 直接打印）。
+    pub fn summary(&self) -> String {
+        format!(
+            "导入 {} 个（{:.1} MB），跳过 {} 个已存在，失败 {} 个",
+            self.imported,
+            self.bytes as f64 / 1024.0 / 1024.0,
+            self.skipped,
+            self.failed
+        )
+    }
+}
+
+/// 批量导入一个目录（保留相对目录结构）。
+///
+/// - `target_prefix` 为空 = 直接放在安全区根下；否则当作目标子目录（如 `技术部\2026`）。
+/// - **不覆盖**已存在的同名密文（算作跳过并提示），避免把用户旧版本冲掉。
+/// - 单个文件失败不中断整批（记录后继续），最后给出汇总。
+pub fn import_tree(
+    options: &SecureAreaOptions,
+    key: &[u8; 32],
+    source_dir: &Path,
+    target_prefix: &str,
+    keep_source: bool,
+) -> Result<ImportReport, String> {
+    if !source_dir.is_dir() {
+        return Err(format!("源目录不存在：{}", source_dir.display()));
+    }
+    let mut report = ImportReport::default();
+    use std::os::windows::fs::MetadataExt as _;
+    let prefix = target_prefix.trim().trim_matches('\\').to_string();
+    let mut stack = vec![source_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            dhrust::warn!("跳过无法读取的目录：{}", dir.display());
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            // 重解析点（符号链接/联接点）一律不跟随，避免环路与越界。
+            if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                dhrust::warn!("跳过符号链接/联接点：{}", path.display());
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|v| v.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if should_skip_import(&name) {
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Ok(sub) = path.strip_prefix(source_dir) else {
+                continue;
+            };
+            let sub = sub.to_string_lossy().to_string();
+            let relative = if prefix.is_empty() {
+                sub
+            } else {
+                format!("{prefix}\\{sub}")
+            };
+            let vault_path = options
+                .vault
+                .join(format!("{}.{VAULT_EXT}", relative.replace('/', "\\")));
+            if vault_path.is_file() {
+                report.skipped += 1;
+                dhrust::info!("已存在，跳过：{relative}");
+                continue;
+            }
+            match import_file(options, key, &path, &relative, keep_source) {
+                Ok(_) => {
+                    report.imported += 1;
+                    report.bytes += meta.len();
+                }
+                Err(e) => {
+                    report.failed += 1;
+                    dhrust::warn!("导入失败（{relative}）：{e}");
+                    if report.failures.len() < 20 {
+                        report.failures.push((relative, e));
+                    }
+                }
+            }
+        }
+    }
+    dhrust::info!("批量导入完成：{}", report.summary());
+    Ok(report)
 }
 
 /// 安全区是否可用（系统支持 ProjFS 且目录里没有“别人的实体文件”）。
@@ -1254,6 +1382,23 @@ mod tests {
         assert_eq!(normalize_dir("\\sub\\dir"), "sub\\dir");
         assert_eq!(normalize_dir("/sub/dir"), "sub\\dir");
         assert_eq!(normalize_dir(""), "");
+    }
+
+    #[test]
+    fn import_skips_office_lock_and_system_junk() {
+        // Office 锁文件、缩略图、临时文件、隐藏文件一律不搬进密文库
+        assert!(should_skip_import("~$采购合同.docx"));
+        assert!(should_skip_import("Thumbs.db"));
+        assert!(should_skip_import("desktop.ini"));
+        assert!(should_skip_import("a.tmp"));
+        assert!(should_skip_import("a.BAK"));
+        assert!(should_skip_import("x.crdownload"));
+        assert!(should_skip_import(".gitignore"));
+        assert!(should_skip_import(""));
+        // 正常文档照常导入
+        assert!(!should_skip_import("采购合同.docx"));
+        assert!(!should_skip_import("设计图纸.dwg"));
+        assert!(!should_skip_import("报表.xlsx"));
     }
 
     #[test]
