@@ -65,6 +65,8 @@ pub struct DriverStats {
     pub ads_error: i64,
     pub last_ads_file_id: [u8; 8],
     pub ads_skipped: i64,
+    /// 魔数/版本合法但 SHA-256 校验和对不上：标记被篗改或写坏了
+    pub ads_tampered: i64,
 }
 
 impl Default for DriverStats {
@@ -88,6 +90,7 @@ impl Default for DriverStats {
             ads_error: 0,
             last_ads_file_id: [0u8; 8],
             ads_skipped: 0,
+            ads_tampered: 0,
         }
     }
 }
@@ -328,8 +331,8 @@ mod tests {
     #[test]
     fn stats_layout_matches_driver() {
         // 驱动侧：5+3 个 LONGLONG(64) + 3 个 ULONG(12) + WCHAR[260](520) = 596 → 对齐 600
-        //        M2a 追加：4 个 LONGLONG(32) + UCHAR[8] + LONGLONG(8) = 48 → 648
-        assert_eq!(std::mem::size_of::<DriverStats>(), 648, "与驱动 OUG_STATS 不一致");
+        //        M2a：4 个 LONGLONG(32) + UCHAR[8] + 2 个 LONGLONG(16) = 56 → 656
+        assert_eq!(std::mem::size_of::<DriverStats>(), 656, "与驱动 OUG_STATS 不一致");
     }
 
     #[test]

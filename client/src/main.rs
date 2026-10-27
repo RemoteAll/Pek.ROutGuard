@@ -1123,13 +1123,19 @@ fn driver_command(args: &[String]) -> u8 {
                     println!();
                     println!("加密标记探测（M2a，只读 :oug 流，不改任何数据）：");
                     println!(
-                        "  AdsHit={}  AdsAbsent={}  AdsBroken={}  AdsError={}  AdsSkipped={}",
-                        stats.ads_hit, stats.ads_absent, stats.ads_broken, stats.ads_error, stats.ads_skipped
+                        "  AdsHit={}  AdsAbsent={}  AdsBroken={}  AdsError={}  AdsSkipped={}  AdsTampered={}",
+                        stats.ads_hit, stats.ads_absent, stats.ads_broken, stats.ads_error,
+                        stats.ads_skipped, stats.ads_tampered
                     );
                     println!(
-                        "  （已加密 {} 个，无标记 {} 个，标记损坏 {} 个，探测失败 {} 次，跳过 {} 次）",
-                        stats.ads_hit, stats.ads_absent, stats.ads_broken, stats.ads_error, stats.ads_skipped
+                        "  （已加密 {} 个，无标记 {} 个，标记损坏 {} 个，探测失败 {} 次，跳过 {} 次，校验和不符 {} 个）",
+                        stats.ads_hit, stats.ads_absent, stats.ads_broken, stats.ads_error,
+                        stats.ads_skipped, stats.ads_tampered
                     );
+                    if stats.ads_tampered > 0 {
+                        println!("  ⚠ 校验和不符表示标记可能被篡改：驱动**不会**用这些 file_id 加解密");
+                        println!("    请用 rescue scan --deep 定位文件，并按安全事件上报");
+                    }
                     let file_id = stats.last_file_id_display();
                     if !file_id.is_empty() {
                         println!("  最近 file_id：{file_id}");

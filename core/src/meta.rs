@@ -141,6 +141,52 @@ mod tests {
         assert_eq!(FileMeta::decode(&bytes).expect("解析"), meta);
     }
 
+    /// **两端对照的黄金样本**。
+    ///
+    /// 内核用 BCrypt 算 SHA-256、用户态用 Rust `sha2` 算——两者必须产出完全相同的 32 字节，
+    /// 否则驱动会把所有合法标记判成"篡改"（`AdsTampered`），M2b 直接瘫痪。
+    ///
+    /// 这类漂移（换哈希实现、改偏移、改字段长度）在功能测试里很难暴露，
+    /// 所以锁死一整个 32 字节的样本：谁动了格式，这条测试立刻失败。
+    #[test]
+    fn golden_meta_bytes() {
+        let meta = FileMeta {
+            file_id: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+            created_at: 0x0102_0304_0506_0708,
+            flags: FLAG_ENCRYPTED,
+        };
+        let bytes = meta.encode();
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+        assert_eq!(&bytes[0..4], b"OGM1", "魔数");
+        assert_eq!(bytes[4], 1, "版本");
+        assert_eq!(bytes[5], FLAG_ENCRYPTED, "标志位");
+        assert_eq!(bytes[6..8], [0, 0], "保留位必须为 0");
+        assert_eq!(
+            bytes[8..16],
+            [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+            "file_id 必须小端原样写入"
+        );
+        assert_eq!(
+            bytes[16..24],
+            [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01],
+            "created_at 必须小端写入"
+        );
+
+        // 校验和锁定：已用 CNG（Windows BCrypt，.NET SHA256 走的就是它）独立算过，
+        // 与本值完全一致 —— 即内核的 BCrypt 实现与这里的 sha2 实现算法相同。
+        assert_eq!(
+            &hex[48..64],
+            "6463c5099f757a10",
+            "校验和与内核 BCrypt 参考值不一致（改了哈希算法或字段偏移？）"
+        );
+        assert_eq!(
+            hex,
+            "4f474d3101010000112233445566778808070605040302016463c5099f757a10",
+            "完整 32 字节黄金样本漂移"
+        );
+    }
+
     #[test]
     fn rejects_truncated() {
         let bytes = sample().encode();

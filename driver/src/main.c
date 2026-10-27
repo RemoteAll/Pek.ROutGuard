@@ -16,6 +16,8 @@ Pek.ROutGuard 文件过滤驱动 —— M1（规则判定 + 控制通道，**仍
 #include <ntstrsafe.h>
 /* IoCreateDeviceSecure + SDDL：控制设备必须限制为 SYSTEM/管理员可访问 */
 #include <wdmsec.h>
+/* BCrypt SHA-256：校验 ADS 元数据的校验和（防篗改） */
+#include <bcrypt.h>
 
 #define OUG_POOL_TAG        'GdOP'
 
@@ -55,6 +57,7 @@ typedef struct _OUG_STATS {
     LONGLONG AdsError;       /* 打不开/读失败（权限异常、文件被删等真实问题） */
     UCHAR    LastAdsFileId[8]; /* 最近一次读到的 file_id（XTS tweak 基值） */
     LONGLONG AdsSkipped;     /* 未探测：IRQL 不合适（分页 I/O）等不可做的情形，**不是错误** */
+    LONGLONG AdsTampered;    /* 魔数/版本合法但**校验和对不上**：标记被篡改或写坏了 */
 } OUG_STATS, *POUG_STATS;
 
 /* 规则集：路径前缀（NT 路径，大小写不敏感）+ 扩展名（含点，如 .DOCX） */
@@ -74,9 +77,14 @@ static PDEVICE_OBJECT g_DeviceObject = NULL;
 static OUG_STATS    g_Stats;
 static volatile LONG g_Enabled = 1;
 
+/* SHA-256 算法句柄：在 DriverEntry 打开一次，全局复用。
+   每次探测都 Open/Cose 算法提供程序太贵（分配 + 注册表访问）。
+   BCrypt 算法句柄本身是线程安全的，并发时只需各自 CreateHash。 */
+static BCRYPT_ALG_HANDLE g_Sha256Alg = NULL;
+
 /* 与用户态 `client/src/driver.rs` 的断言一一对应：
    任何一侧改了结构体，这里编译不过，Rust 那边测试也不过 —— 双保险防“协议悄悄漂移”。 */
-C_ASSERT(sizeof(OUG_STATS) == 648);
+C_ASSERT(sizeof(OUG_STATS) == 656);
 C_ASSERT(sizeof(OUG_RULES) == 9356);
 
 /* ————— M2a：NTFS 备用数据流（ADS）元数据（与 core::meta 严格一致）————— */
@@ -88,6 +96,9 @@ C_ASSERT(sizeof(OUG_RULES) == 9356);
 #define OUG_META_FLAG_ENCRYPTED  0x01       /* 位 0 = 已加密 */
 #define OUG_META_OFF_FLAGS       5          /* flags 字节偏移 */
 #define OUG_META_OFF_FILEID      8          /* file_id 8 字节偏移 */
+#define OUG_META_OFF_CHECKSUM    24         /* 校验和 8 字节偏移：SHA-256(bytes[0..24])[0..8] */
+#define OUG_META_CHECKSUM_BYTES  8          /* 只存 SHA-256 前 8 字节 */
+#define OUG_SHA256_LEN           32
 
 /* 规则表：**双缓冲无锁读**。
 
@@ -205,6 +216,54 @@ OugRulesMatch(
     }
     return FALSE;
 }
+/* ————— 元数据校验和验证（防篗改）—————
+
+   为什么内核必须自己验：
+       如果攻击者把 ADS 里的 file_id 改掉、而魔数和版本仍然合法，
+       驱动就会拿错误的 tweak 去解密 —— 得到一堆乱码，
+       应用若把乱码回写，文件就真坏了（不可逆）。
+
+   算法与 core/src/meta.rs 完全一致：checksum = SHA-256(bytes[0..24])[0..8]
+
+   返回 TRUE 仅当校验和匹配。任何失败（含 BCrypt 出错）都返回 FALSE ——
+   **存疑不信**：宁可当作“未加密/不可用”，也不能用可疑的 file_id 去加解密。*/
+static BOOLEAN
+OugMetaChecksumValid(
+    _In_reads_(OUG_META_LEN) const UCHAR* Meta
+)
+{
+    BCRYPT_HASH_HANDLE hash = NULL;
+    UCHAR digest[OUG_SHA256_LEN];
+    NTSTATUS status;
+    BOOLEAN ok = FALSE;
+
+    if (g_Sha256Alg == NULL) {
+        return FALSE;   /* 算法不可用：无法验证就不信 */
+    }
+
+    status = BCryptCreateHash(g_Sha256Alg, &hash, NULL, 0, NULL, 0, 0);
+    if (!NT_SUCCESS(status)) {
+        return FALSE;
+    }
+
+    status = BCryptHashData(hash, (PUCHAR)Meta, OUG_META_OFF_CHECKSUM, 0);
+    if (NT_SUCCESS(status)) {
+        status = BCryptFinishHash(hash, digest, sizeof(digest), 0);
+    }
+    BCryptDestroyHash(hash);
+
+    if (!NT_SUCCESS(status)) {
+        return FALSE;
+    }
+
+    /* 定长比较普通 memcmp 即可（长度不泄露信息，不存在时序攻击面） */
+    ok = (RtlCompareMemory(digest, Meta + OUG_META_OFF_CHECKSUM, OUG_META_CHECKSUM_BYTES)
+          == OUG_META_CHECKSUM_BYTES);
+
+    RtlSecureZeroMemory(digest, sizeof(digest));
+    return ok;
+}
+
 /* ————— M2a：ADS 元数据探测（**只读**，不改任何数据）—————
 
    目的：命中受控规则的文件，驱动需要知道它"到底加密了没有"以及"它的 file_id 是什么"。
@@ -339,7 +398,11 @@ OugProbeMetaAds(
         InterlockedIncrement64(&g_Stats.AdsBroken);
         return;
     }
-
+    /* 校验和：魔数合法不等于内容可信 —— 必须验 SHA-256，否则可以用错的 file_id 解密。 */
+    if (!OugMetaChecksumValid(meta)) {
+        InterlockedIncrement64(&g_Stats.AdsTampered);
+        return;
+    }
     if ((meta[OUG_META_OFF_FLAGS] & OUG_META_FLAG_ENCRYPTED) == 0) {
         /* 标记在但未置加密位：视为未加密（加密中途失败的残留由用户态清理） */
         InterlockedIncrement64(&g_Stats.AdsAbsent);
@@ -720,6 +783,7 @@ OugDeviceControl(
         g_Stats.AdsBroken = 0;
         g_Stats.AdsError = 0;
         g_Stats.AdsSkipped = 0;
+        g_Stats.AdsTampered = 0;
         RtlZeroMemory(g_Stats.LastAdsFileId, sizeof(g_Stats.LastAdsFileId));
         status = STATUS_SUCCESS;
         outLen = 0;
@@ -806,6 +870,10 @@ OugFilterUnload(
         g_Filter = NULL;
     }
     OugDeleteControlDevice();
+    if (g_Sha256Alg != NULL) {
+        BCryptCloseAlgorithmProvider(g_Sha256Alg, 0);
+        g_Sha256Alg = NULL;
+    }
     DbgPrint("[PekOutGuard] driver unloaded\n");
     return STATUS_SUCCESS;
 }
@@ -828,6 +896,16 @@ DriverEntry(
     RtlZeroMemory(g_RulesBuf, sizeof(g_RulesBuf));
     InterlockedExchange(&g_RulesIndex, 0);
     RtlZeroMemory(&g_Stats, sizeof(g_Stats));
+
+    /* 打开 SHA-256 算法提供程序（全局一次）。
+       打不开就**拒绝加载**：验不了校验和就无法安全地使用 file_id，
+       带着这个缺陷运行等于给数据损坏留了口子。 */
+    status = BCryptOpenAlgorithmProvider(&g_Sha256Alg, BCRYPT_SHA256_ALGORITHM, NULL, 0);
+    if (!NT_SUCCESS(status)) {
+        DbgPrint("[PekOutGuard] BCryptOpenAlgorithmProvider(SHA-256) failed 0x%08X —— 拒绝加载\n", status);
+        g_Sha256Alg = NULL;
+        return status;
+    }
     /* minifilter 的卸载走 FilterUnloadCallback，不需要 DriverObject->DriverUnload。 */
     status = OugCreateControlDevice(DriverObject);
     if (!NT_SUCCESS(status)) {

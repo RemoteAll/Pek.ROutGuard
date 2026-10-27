@@ -106,7 +106,7 @@ $linkArgs = @(
     "/LIBPATH:`"$msvcPath\lib\x64`"",
     "/OUT:`"$sys`"",
     "`"$obj`"",
-    'ntoskrnl.lib', 'fltMgr.lib', 'wdmsec.lib', 'BufferOverflowK.lib'
+    'ntoskrnl.lib', 'fltMgr.lib', 'wdmsec.lib', 'BufferOverflowK.lib', 'ksecdd.lib'
 )
 & "$msvcPath\bin\Hostx64\x64\link.exe" @linkArgs
 if ($LASTEXITCODE -ne 0) { throw "链接失败（link.exe 退出码 $LASTEXITCODE）" }

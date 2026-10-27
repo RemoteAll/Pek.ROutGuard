@@ -234,6 +234,60 @@ Add-Result -Name '已加密文件被识别（AdsHit ≥ 1）' -Ok (($ads['AdsHit
 Add-Result -Name '明文文件被识别为无标记（AdsAbsent ≥ 1）' -Ok (($ads['AdsAbsent']) -ge 1) -Detail "AdsAbsent=$($ads['AdsAbsent'])"
 Add-Result -Name '无标记损坏误报（AdsBroken = 0）' -Ok (($ads['AdsBroken']) -eq 0) -Detail "AdsBroken=$($ads['AdsBroken'])"
 
+# ————— 6b. 篡改检测（R1 的修复验证）—————
+# 造一个「魔数/版本合法、但校验和不对」的标记：攻击者改了 file_id 却不知道要重算校验和。
+# 驱动必须识别为 AdsTampered 并且**绝不**采信其中的 file_id。
+$tamperedSample = Join-Path $TestDir '被篡改样本.ougtest'
+[System.IO.File]::WriteAllText($tamperedSample, ('C' * 200), (New-Object System.Text.UTF8Encoding($false)))
+
+# 32 字节：'OGM1' + v1 + flags=1 + 保留 + 伪造 file_id + 时间 + 全 0 的假校验和
+$badMeta = [byte[]]@(
+    0x4F, 0x47, 0x4D, 0x31, 0x01, 0x01, 0x00, 0x00,   # OGM1 / v1 / flags=已加密 / 保留
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,   # file_id（伪造）
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,   # created_at
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00    # 校验和（假的，必然对不上）
+)
+
+# 写二进制 ADS：.NET 的 File API 与 cmd 的 copy/type 都不支持 ADS 路径，
+# 只有 Win32 的 CreateFileW 能打开 "file:stream" 形式的名字。
+if (-not ('OugAdsWriter' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class OugAdsWriter {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(
+        string lpFileName, uint dwDesiredAccess, uint dwShareMode,
+        IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+        uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool WriteFile(
+        Microsoft.Win32.SafeHandles.SafeFileHandle h, byte[] buffer,
+        uint numberOfBytesToWrite, out uint numberOfBytesWritten, IntPtr overlapped);
+    public static bool Write(string path, byte[] data) {
+        // GENERIC_WRITE=0x40000000, SHARE_READ|WRITE|DELETE=7, CREATE_ALWAYS=2, NORMAL=0x80
+        var h = CreateFileW(path, 0x40000000, 7, IntPtr.Zero, 2, 0x80, IntPtr.Zero);
+        if (h.IsInvalid) { return false; }
+        uint written;
+        bool ok = WriteFile(h, data, (uint)data.Length, out written, IntPtr.Zero);
+        h.Dispose();
+        return ok && written == data.Length;
+    }
+}
+'@
+}
+$wroteOk = [OugAdsWriter]::Write("$tamperedSample`:oug", $badMeta)
+Add-Result -Name '篡改样本已构造（坏 ADS 已写入）' -Ok $wroteOk -Detail $(if ($wroteOk) { '32 字节伪造标记' } else { 'WriteFile 失败（无法验证篡改检测）' })
+
+Invoke-Client -Exe $exe -Arguments @('driver', 'reset') | Out-Null
+Start-Sleep -Milliseconds 300
+[System.IO.File]::ReadAllBytes($tamperedSample) | Out-Null
+Start-Sleep -Milliseconds 600
+
+$tampered = Get-DriverStatus -Exe $exe
+Add-Result -Name '篡改标记被识别（AdsTampered ≥ 1）' -Ok (($tampered['AdsTampered']) -ge 1) -Detail "AdsTampered=$($tampered['AdsTampered'])"
+Add-Result -Name '篡改标记不被采信（AdsHit = 0）' -Ok (($tampered['AdsHit']) -eq 0) -Detail "AdsHit=$($tampered['AdsHit'])（应为 0）"
+
 # ————— 7. 收尾 —————
 Write-Host "`n[7/7] 收尾" -ForegroundColor Yellow
 
