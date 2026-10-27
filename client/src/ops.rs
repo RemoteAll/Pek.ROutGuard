@@ -215,11 +215,7 @@ pub fn encrypt_file(
 
 /// 回读校验：完整解密到 sink（验证头部/密钥/每块 GCM/尾部 SHA-256）。
 fn verify_container(key: &[u8; crypto::KEY_LEN], path: &Path) -> Result<(), String> {
-    let mut reader = std::io::BufReader::new(
-        std::fs::File::open(path).map_err(|e| format!("打开新容器失败：{e}"))?,
-    );
-    let mut sink = std::io::sink();
-    container::decrypt_stream(key, &mut reader, &mut sink)
+    container::verify_file(path, key)
         .map(|_| ())
         .map_err(|e| e.to_string())
 }

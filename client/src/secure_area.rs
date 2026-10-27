@@ -256,6 +256,12 @@ impl SecureArea {
             format!("落位密文失败：{e}")
         })?;
 
+        // 校验密文能完整解出来，否则不碰实体明文（这是不可逆丢失的唯一防线）。
+        if let Err(e) = pek_outguard_core::container::verify_file(&vault_path, &key) {
+            let _ = std::fs::remove_file(&vault_path);
+            return Err(format!("密文校验失败（实体明文已保留）：{e}"));
+        }
+
         // ② 让 ProjFS 把这个“实体明文文件”抷回占位符（按 flags 允许丢弃本地数据）。
         //    注意：不能先删再 PrjWritePlaceholderInfo——ProjFS 的目录缓存会把它当成已删除。
         demote_to_placeholder(self.context, &relative, path, plain.len() as i64)?;
@@ -1003,6 +1009,12 @@ pub fn import_file(
         let _ = std::fs::remove_file(&temp);
         format!("落位密文失败：{e}")
     })?;
+
+    // 校验密文能完整解出来，通过后才允许删源文件。
+    if let Err(e) = pek_outguard_core::container::verify_file(&vault_path, key) {
+        let _ = std::fs::remove_file(&vault_path);
+        return Err(format!("密文校验失败（源文件未删）：{e}"));
+    }
 
     if !keep_source
         && let Err(e) = std::fs::remove_file(source)

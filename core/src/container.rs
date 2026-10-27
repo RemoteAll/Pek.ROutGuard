@@ -439,6 +439,20 @@ impl<R: Read> Read for HashingReader<'_, R> {
     }
 }
 
+/// 校验一个容器文件能否被**完整**还原：头部、密钥块、每个分块的 GCM、尾部 SHA-256 全部通过。
+///
+/// 写入方（客户端加密、安全区落盘、导入）必须在删除原文件/降级占位符**之前**调用，
+/// 否则一旦磁盘写坏就是不可逆的数据丢失。返回明文大小。
+pub fn verify_file(path: &std::path::Path, kek: &[u8; KEY_LEN]) -> Result<u64> {
+    let mut reader = std::io::BufReader::new(
+        std::fs::File::open(path)
+            .map_err(|e| Error::Io(std::io::Error::new(e.kind(), format!("打开待校验容器失败：{e}"))))?,
+    );
+    let mut sink = std::io::sink();
+    let summary = decrypt_stream(kek, &mut reader, &mut sink)?;
+    Ok(summary.plain_size)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

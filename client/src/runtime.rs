@@ -102,7 +102,15 @@ pub fn run(base: &Path) -> Result<(), String> {
                         let state = shared.lock().map_err(|_| "状态锁不可用".to_string())?;
                         (state.policy_version, state.policy.is_some())
                     };
-                    if remote_version != local_version || !has_policy {
+                    // 密钥健康检查：终端令牌换发（重装/重新注册）后旧包裹会失效，
+                    // 不主动重同步的话，所有文件都会“打不开”——必须能自己恢复。
+                    let key_broken = has_policy && !policy_key_usable(&shared);
+                    if remote_version != local_version || !has_policy || key_broken {
+                        if key_broken {
+                            dhrust::warn!(
+                                "本地策略密钥不可用（终端令牌可能已换发），强制重新同步…"
+                            );
+                        }
                         dhrust::info!("策略需要同步：本地 v{local_version} → 服务端 v{remote_version}");
                         if let Err(e) = sync_policy_from_shared(base, &api, &shared) {
                             dhrust::warn!("策略同步失败（继续用本地缓存）：{e}");
@@ -252,6 +260,23 @@ fn mark_online(base: &Path, shared: &Arc<Mutex<ClientState>>) {
     {
         dhrust::warn!("在线状态落盘失败（不影响运行）：{e}");
     }
+}
+
+/// 本地缓存的策略密钥是否还能解开（纯内存，微秒级）。
+///
+/// 解不开的典型原因：终端重装/重新注册换发了令牌，而 `wrapped_key` 是用**旧令牌**包裹的。
+fn policy_key_usable(shared: &Arc<Mutex<ClientState>>) -> bool {
+    let Ok(state) = shared.lock() else {
+        return true;
+    };
+    let Some(policy) = state
+        .policy
+        .as_ref()
+        .and_then(|bundle| bundle.policy_sets.first())
+    else {
+        return true;
+    };
+    ops::policy_key(&state, &policy.id).is_ok()
 }
 
 /// 未注册时的重试（首次安装即断网的场景）。成功后立刻补同步策略。
@@ -428,6 +453,19 @@ fn sync_policy(
     state.last_online = chrono::Utc::now().timestamp();
     state.offline_reported = false;
     state::save(base, state)?;
+    // 同步后立即验证密钥可用（令牌换发后旧包裹失效，必须当场发现，不能等用户打不开文件）。
+    if let Some(policy) = state
+        .policy
+        .as_ref()
+        .and_then(|bundle| bundle.policy_sets.first())
+        && let Err(e) = ops::policy_key(state, &policy.id)
+    {
+        dhrust::warn!(
+            "新下发的策略密钥无法解包（policy={}）：{e}；\
+             若终端曾重装/重新注册，请重启客户端让它重新注册",
+            policy.id
+        );
+    }
     dhrust::info!(
         "策略已同步：version={} 监控根={}",
         state.policy_version,

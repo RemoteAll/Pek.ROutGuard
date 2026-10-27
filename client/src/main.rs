@@ -44,6 +44,7 @@ fn main() -> ExitCode {
         Some("decrypt") => decrypt_command(&base, args.get(1..).unwrap_or(&[])),
         Some("open") => open_command(&base, args.get(1).map(String::as_str)),
         Some("sessions") => sessions_command(&base),
+        Some("vault") => vault_command(&base, args.get(1..).unwrap_or(&[])),
         Some("secure-area") => secure_area_command(&base, args.get(1..).unwrap_or(&[])),
         Some("mode") => mode_command(&base, args.get(1..).unwrap_or(&[])),
         Some("install") => install_command(&base),
@@ -91,6 +92,7 @@ fn print_help() {
          \x20 pek-outguard-client decrypt <file> [--out DIR]  解密到受控目录\n\
          \x20 pek-outguard-client open <file>            受控打开（编辑保存后自动回写成密文）\n\
          \x20 pek-outguard-client sessions              列出受控打开会话\n\
+         \x20 pek-outguard-client vault verify [--vault DIR]  密文库体检（逐个校验能否解密）\n\
          \x20 pek-outguard-client mode [show|live --confirm|dry-run]  运行模式（默认演练，不动文件）\n\
          \x20 pek-outguard-client register-assoc        注册 .ogd 关联（双击直接打开，免管理员）\n\
          \x20 pek-outguard-client unregister-assoc      解除 .ogd 关联\n\
@@ -713,6 +715,98 @@ fn open_command(base: &Path, path: Option<&str>) -> u8 {
             eprintln!("打开失败：{e}");
             1
         }
+    }
+}
+
+/// 密文库体检：逐个校验能否完整解密（GCM + 尾部 SHA-256），报告损坏文件。
+///
+/// 用途：**用户在抱怨"文件打不开"之前**先自查；备份/迁移前后校验；磁盘异常后排查。
+fn vault_command(base: &Path, args: &[String]) -> u8 {
+    let state = state::load(base);
+    if state.policy.is_none() {
+        eprintln!("尚未同步策略（先执行 sync）；没有密钥无法校验");
+        return 1;
+    }
+    let vault_root = arg_value(args, "--vault")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| base.join("Data").join("Vault"));
+    if !vault_root.is_dir() {
+        println!("密文库不存在（还没有加密过任何文件）：{}", vault_root.display());
+        return 0;
+    }
+
+    let mut files = Vec::new();
+    let mut stack = vec![vault_root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().map(|e| e == "ogd").unwrap_or(false) {
+                files.push(path);
+            }
+        }
+    }
+    if files.is_empty() {
+        println!("密文库为空：{}", vault_root.display());
+        return 0;
+    }
+
+    println!("正在校验 {} 个容器……", files.len());
+    let mut good = 0usize;
+    let mut bad = Vec::new();
+    let mut total = 0u64;
+    for path in &files {
+        // 按容器头里的 policyId 取密钥
+        let policy_id = {
+            let mut reader = match std::fs::File::open(path) {
+                Ok(file) => std::io::BufReader::new(file),
+                Err(e) => {
+                    bad.push((path.clone(), format!("打开失败：{e}")));
+                    continue;
+                }
+            };
+            match pek_outguard_core::container::read_header(&mut reader) {
+                Ok(header) => header.policy_id,
+                Err(e) => {
+                    bad.push((path.clone(), format!("头部损坏：{e}")));
+                    continue;
+                }
+            }
+        };
+        let key = match ops::policy_key(&state, &policy_id) {
+            Ok(key) => key,
+            Err(e) => {
+                bad.push((path.clone(), format!("密钥不可用（policy={policy_id}）：{e}")));
+                continue;
+            }
+        };
+        match pek_outguard_core::container::verify_file(path, &key) {
+            Ok(size) => {
+                good += 1;
+                total += size;
+            }
+            Err(e) => bad.push((path.clone(), format!("校验失败：{e}"))),
+        }
+    }
+
+    println!();
+    println!("正常：{good} 个（明文合计 {} 字节）", total);
+    if bad.is_empty() {
+        println!("损坏：0 个 —— 密文库完好");
+        0
+    } else {
+        println!("损坏：{} 个", bad.len());
+        for (path, reason) in &bad {
+            println!("  × {} —— {reason}", path.display());
+        }
+        println!();
+        println!("建议：① 立即停止对磁盘的写入；② 从备份恢复这些文件；");
+        println!("      ③ 不要删除密文库——损坏的容器仍有取证/恢复价值。");
+        1
     }
 }
 
