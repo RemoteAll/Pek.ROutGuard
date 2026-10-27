@@ -208,16 +208,27 @@ impl SecureArea {
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        // ProjFS 的 placeholder 状态变化也会触发 Modify，导致同内容反复"落盘加密"。
-        // 内容没变时只把实体降级回占位符（必须做，否则磁盘留明文），但不重复加密、不记审计。
-        let unchanged = inner
+        // ProjFS 的 hydrate（用户打开文件）也会触发 Modify，导致同内容反复“落盘加密”。
+        // 去重不能只靠内存表（服务重启就空了）——**以密文库容器头里的 plainSha256 为准**，
+        // 这样“打开→浏览→关闭”全程不会重写密文，只有内容真的变了才重新加密。
+        let vault_path = inner.vault_path(&relative);
+        let known_hash = inner
             .sealed
             .lock()
             .ok()
-            .and_then(|map| map.get(&relative).copied())
-            == Some(plain_hash);
+            .and_then(|map| map.get(&relative).copied());
+        let unchanged = match known_hash {
+            Some(hash) => hash == plain_hash,
+            None => {
+                container_plain_hash(&vault_path)
+                    == Some(pek_outguard_core::crypto::hex(&plain_hash))
+            }
+        };
         if unchanged {
             demote_to_placeholder(self.context, &relative, path, plain.len() as i64)?;
+            if let Ok(mut sealed) = inner.sealed.lock() {
+                sealed.insert(relative.clone(), plain_hash);
+            }
             return Ok(());
         }
 
@@ -239,7 +250,6 @@ impl SecureArea {
         };
 
         // ① 先写密文（同目录 .tmp 再改名）
-        let vault_path = inner.vault_path(&relative);
         if let Some(parent) = vault_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建密文库目录失败：{e}"))?;
         }
@@ -280,6 +290,13 @@ impl SecureArea {
         }
         Ok(())
     }
+}
+
+/// 读容器头里记录的明文 SHA-256（不存在/无记录返回 `None`）。
+fn container_plain_hash(path: &Path) -> Option<String> {
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let header = pek_outguard_core::container::read_header(&mut reader).ok()?;
+    header.plain_sha256
 }
 
 /// 把"被写脏的实体文件"降级回占位符（丢弃本地明文数据）。
