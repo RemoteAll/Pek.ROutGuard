@@ -62,7 +62,7 @@ impl App {
         if let Err(e) = db::ensure_default_policy(&store) {
             dhrust::warn!("默认规则集初始化失败：{e}");
         }
-        Ok(Arc::new(App {
+        let app = Arc::new(App {
             base: base.to_path_buf(),
             server: RwLock::new(server),
             master,
@@ -71,7 +71,11 @@ impl App {
             login_guard: LoginGuard::new(),
             tokens: TokenStore::with_ttl_ms(12 * 60 * 60 * 1000),
             nonces: Mutex::new(HashMap::new()),
-        }))
+        });
+        if let Err(e) = sync_config_fingerprint(&app) {
+            dhrust::warn!("配置指纹比对失败（配置变更可能不会下发）：{e}");
+        }
+        Ok(app)
     }
 
     /// 配置快照。
@@ -134,5 +138,52 @@ impl App {
     /// 运行时长（秒）。
     pub fn uptime_secs(&self) -> u64 {
         self.started.elapsed().as_secs()
+    }
+}
+
+/// 服务端配置指纹：只覆盖**会下发给客户端**的字段。
+///
+/// 这些字段不在"规则 JSON"里，`save_policy` 的比较看不出变化、版本不会涨，
+/// 客户端心跳便永远认为"策略没变"——配置改了不下发。所以启动时比对指纹：
+/// 变化就 `bump_all_policies` 推一版，让客户端重新拉取。
+fn config_fingerprint(server: &ServerSection) -> String {
+    let payload = format!(
+        "company={}|notice={}|class={}|roots={}|exclude={}|uninstall={}|grace={}|auto={}",
+        server.company_name,
+        server.notice,
+        server.classification,
+        server.watch_roots.join(","),
+        server.exclude_paths.join(","),
+        server.allow_uninstall,
+        server.offline_grace_days,
+        server.auto_approve,
+    );
+    pek_outguard_core::crypto::hex(&pek_outguard_core::crypto::sha256(payload.as_bytes()))
+}
+
+const FINGERPRINT_KEY: &str = "config.fingerprint";
+
+/// 比对并（必要时）提升规则集版本。
+fn sync_config_fingerprint(app: &App) -> Result<(), String> {
+    let server = app.server();
+    let fingerprint = config_fingerprint(&server);
+    let stored = db::get_setting(&app.store, FINGERPRINT_KEY)?;
+    match stored {
+        Some(old) if old == fingerprint => Ok(()),
+        Some(old) => {
+            let version = db::bump_all_policies(&app.store)?;
+            dhrust::info!(
+                "服务端配置已变更（{} → {}），规则集版本提升到 v{version}，客户端将重新同步",
+                &old[..old.len().min(12)],
+                &fingerprint[..12]
+            );
+            db::set_setting(&app.store, FINGERPRINT_KEY, &fingerprint)
+        }
+        // 首次启动：只记指纹，不升版本（避免刚装机就把版本推高一版）。
+        None => {
+            db::set_setting(&app.store, FINGERPRINT_KEY, &fingerprint)?;
+            dhrust::info!("已记录服务端配置指纹：{}", &fingerprint[..12]);
+            Ok(())
+        }
     }
 }

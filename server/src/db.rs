@@ -544,6 +544,65 @@ pub fn insert_events(
     Ok((accepted, duplicated))
 }
 
+// ————— 设置（键值）─────
+
+/// 读取设置项（不存在返回 `None`）。
+pub fn get_setting(store: &SharedStore, name: &str) -> Result<Option<String>, String> {
+    let filter = Where::new().eq("Name", DbValue::Text(name.to_string()));
+    Ok(query_one(store, "OgSetting", filter)?
+        .map(|row| db_text(row.get_by_name("Value"))))
+}
+
+/// 写入设置项（存在则覆盖）。
+pub fn set_setting(store: &SharedStore, name: &str, value: &str) -> Result<(), String> {
+    let dal = store.dal();
+    let now = now();
+    let existing = query_one(
+        store,
+        "OgSetting",
+        Where::new().eq("Name", DbValue::Text(name.to_string())),
+    )?;
+    let mut session = dal.open_session().map_err(|e| format!("打开会话失败：{e}"))?;
+    if let Some(row) = existing {
+        let id = db_int(row.get_by_name("Id"));
+        let fields: Vec<(&str, DbValue)> = vec![
+            ("Value", DbValue::Text(value.to_string())),
+            ("UpdateTime", dt(now)),
+        ];
+        table(dal, "OgSetting")?
+            .update_by_pk(session.as_mut(), &fields, &[DbValue::Int(id)])
+            .map_err(|e| format!("更新设置项失败：{e}"))?;
+    } else {
+        let fields: Vec<(&str, DbValue)> = vec![
+            ("Name", DbValue::Text(name.to_string())),
+            ("Value", DbValue::Text(value.to_string())),
+            ("UpdateTime", dt(now)),
+        ];
+        table(dal, "OgSetting")?
+            .insert(session.as_mut(), &fields)
+            .map_err(|e| format!("写入设置项失败：{e}"))?;
+    }
+    Ok(())
+}
+
+/// 把所有规则集版本 +1，返回新的最大版本。
+///
+/// 用途：**服务端配置（WatchRoots/排除项/公司信息/密级/离线宽限/允许卸载）变更时**，
+/// 这些内容不在"规则 JSON"里，`save_policy` 的比较看不出变化、版本不会涨，
+/// 客户端心跳就永远认为"策略没变"→ 配置改了不生效。这里显式推一版。
+pub fn bump_all_policies(store: &SharedStore) -> Result<u32, String> {
+    let dal = store.dal();
+    let mut session = dal.open_session().map_err(|e| format!("打开会话失败：{e}"))?;
+    table(dal, "OgPolicySet")?
+        .increment(
+            session.as_mut(),
+            &[("Version", DbValue::Int(1))],
+            &Where::new().ge("Id", DbValue::Int(0)),
+        )
+        .map_err(|e| format!("提升规则集版本失败：{e}"))?;
+    policy_bundle_version(store)
+}
+
 /// 最近事件（面板视图；按时间倒序）。
 pub fn list_events(store: &SharedStore, limit: usize) -> Result<Vec<Value>, String> {
     let dal = store.dal();

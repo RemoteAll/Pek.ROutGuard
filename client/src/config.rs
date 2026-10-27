@@ -39,6 +39,27 @@ pub struct ClientSection {
     pub watch_roots: Vec<String>,
     /// 审计事件上报间隔（秒）
     pub report_interval_secs: u64,
+    /// 运行模式：`dry_run`（演练，默认）或 `live`（实盘）。
+    ///
+    /// **演练模式只判定与记日志，绝不加密、不删除、不替换任何文件**。
+    /// 调试/试点阶段必须保持 `dry_run`；确认无误后用
+    /// `pek-outguard-client mode live --confirm` 切换（写配置 + 记审计）。
+    pub mode: String,
+    /// 加密成功后原文件的回收保留天数（0 = 直接删除，不推荐）。
+    ///
+    /// 实盘模式下原文件不直接删，而是移到 `Data/Recovery/<日期>/`，保留期满再清理；
+    /// 这样即使判定/加密出问题也能拿回原文件。
+    pub recovery_keep_days: u32,
+    /// 是否允许把「桌面/文档/下载/盘符根/系统目录」这类危险目录作为监控根。
+    /// 默认 `false`：这些目录会被直接跳过并告警，避免误加密整个用户资料。
+    pub allow_risky_roots: bool,
+}
+
+impl ClientSection {
+    /// 是否演练模式（默认是：`mode` 为空或不是 `live` 都当演练）。
+    pub fn is_dry_run(&self) -> bool {
+        !self.mode.trim().eq_ignore_ascii_case("live")
+    }
 }
 
 impl Default for ClientSection {
@@ -51,6 +72,9 @@ impl Default for ClientSection {
             temp_dir: String::new(),
             watch_roots: Vec::new(),
             report_interval_secs: 30,
+            mode: "dry_run".to_string(),
+            recovery_keep_days: 7,
+            allow_risky_roots: false,
         }
     }
 }

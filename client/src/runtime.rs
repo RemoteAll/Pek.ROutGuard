@@ -19,7 +19,7 @@ use crate::api::Api;
 use crate::config::{self, ClientSection};
 use crate::state::{self, ClientState};
 use crate::watch::{self, WatchHandle};
-use crate::{VERSION, ops};
+use crate::{VERSION, opensession, ops, safety};
 
 /// 停止标志（服务 Stop/Shutdown 或 Ctrl+C 置位）。
 pub static STOP: AtomicBool = AtomicBool::new(false);
@@ -68,8 +68,14 @@ pub fn run(base: &Path) -> Result<(), String> {
     }
 
     let shared = Arc::new(Mutex::new(initial));
-    let mut watcher = start_watch(base, Arc::clone(&shared))?;
+    let options = run_options(base, &section);
+    let mut watcher = start_watch(base, Arc::clone(&shared), &options)?;
     let mut current_roots = roots_of(&watcher);
+
+    // 受控打开回写：监听受控临时目录，用户保存明文后自动重新加密回 `.ogd`。
+    // 这是“打开→编辑→保存”闭环的关键：没有它，用户的修改只落在临时明文上。
+    let temp_dir = config::temp_dir(&section);
+    let _session_watch = start_session_watch(base, &temp_dir, Arc::clone(&shared));
 
     let mut tick: u32 = 0;
     while !STOP.load(Ordering::SeqCst) {
@@ -109,12 +115,27 @@ pub fn run(base: &Path) -> Result<(), String> {
 
         // ③ 让文件监控与「当前生效策略的 WatchRoots」保持一致：
         //    覆盖「离线补同步后才有根」与「策略取消监控根」两种转换（只在变化时重建）。
-        if let Err(e) = reconcile_watch(base, &shared, &mut watcher, &mut current_roots) {
+        if let Err(e) = reconcile_watch(base, &shared, &mut watcher, &mut current_roots, &options) {
             dhrust::warn!("重建文件监控失败（下轮重试）：{e}");
         }
 
         // ④ 离线超期检查（纯内存计算，无 IO）。
         check_offline(&shared);
+
+        // ⑤ 受控打开会话清理（每 10 分钟一次，而非每轮；纯本地文件操作）。
+        if tick.is_multiple_of(20) {
+            let purged = opensession::purge_expired(base, chrono::Utc::now().timestamp());
+            if purged > 0 {
+                dhrust::info!("已清理 {purged} 个受控打开的临时明文");
+            }
+            let removed = safety::purge_recovery(base, section.recovery_keep_days);
+            if removed > 0 {
+                dhrust::info!(
+                    "已清理 {removed} 个过期回收区目录（保留 {} 天）",
+                    section.recovery_keep_days
+                );
+            }
+        }
     }
 
     drop(watcher);
@@ -128,8 +149,9 @@ fn reconcile_watch(
     shared: &Arc<Mutex<ClientState>>,
     watcher: &mut Option<WatchHandle>,
     current_roots: &mut Vec<String>,
+    options: &RunOptions,
 ) -> Result<(), String> {
-    let desired: Vec<String> = {
+    let candidates: Vec<String> = {
         let Ok(state) = shared.lock() else {
             return Ok(());
         };
@@ -138,18 +160,53 @@ fn reconcile_watch(
             .as_ref()
             .map(|bundle| bundle.watch_roots.clone())
             .unwrap_or_default()
-            // 与 `start_watch` 同口径：只保留真实存在的目录，避免反复重建。
-            .into_iter()
-            .filter(|path| Path::new(path).is_dir())
-            .collect()
     };
+    // 与 `start_watch` 同口径（含危险目录过滤），避免反复重建。
+    let desired: Vec<String> = safety::filter_roots(&candidates, options.allow_risky_roots).0;
     if desired == *current_roots {
         return Ok(());
     }
     dhrust::info!("监控根变化：{:?} → {desired:?}", *current_roots);
-    *watcher = start_watch(base, Arc::clone(shared))?;
+    *watcher = start_watch(base, Arc::clone(shared), options)?;
     *current_roots = roots_of(watcher);
     Ok(())
+}
+
+/// 运行时安全选项（启动时从配置快照，改配置需重启服务生效）。
+struct RunOptions {
+    /// 加密选项（演练 / 回收区）
+    encrypt: ops::EncryptOptions,
+    /// 是否允许危险监控根
+    allow_risky_roots: bool,
+}
+
+/// 根据配置构造运行选项，并把当前模式显式打印到日志（运维一眼能看出会不会动文件）。
+fn run_options(base: &Path, section: &ClientSection) -> RunOptions {
+    let options = if section.is_dry_run() {
+        dhrust::warn!(
+            "运行模式：演练（dry_run）—— 只判定并记日志，**不会加密、不会移动、不会删除任何文件**；\
+             确认无误后用 `pek-outguard-client mode live --confirm` 切换"
+        );
+        RunOptions {
+            encrypt: ops::EncryptOptions::default(),
+            allow_risky_roots: section.allow_risky_roots,
+        }
+    } else {
+        let recovery = safety::recovery_dir(base);
+        dhrust::warn!(
+            "运行模式：实盘（live）—— 受控目录内的文件会被加密，原文件移入回收区 {}（保留 {} 天）",
+            recovery.display(),
+            section.recovery_keep_days
+        );
+        RunOptions {
+            encrypt: ops::EncryptOptions::live(recovery),
+            allow_risky_roots: section.allow_risky_roots,
+        }
+    };
+    if section.allow_risky_roots {
+        dhrust::warn!("已允许危险监控根（AllowRiskyRoots = true）：桌面/文档/盘符根也可能被加密");
+    }
+    options
 }
 
 /// 在线准备：注册（如需）+ 同步策略。失败即视为离线，由调用方降级处理。
@@ -461,34 +518,138 @@ fn roots_of(handle: &Option<WatchHandle>) -> Vec<String> {
 fn start_watch(
     base: &Path,
     shared: Arc<Mutex<ClientState>>,
+    options: &RunOptions,
 ) -> Result<Option<WatchHandle>, String> {
-    let roots: Vec<PathBuf> = {
+    let candidates: Vec<String> = {
         let state = shared.lock().map_err(|_| "状态锁不可用".to_string())?;
         state
             .policy
             .as_ref()
             .map(|bundle| bundle.watch_roots.clone())
             .unwrap_or_default()
-            .into_iter()
-            .map(PathBuf::from)
-            .filter(|path| path.is_dir())
-            .collect()
     };
+    // 安全阀：危险目录（盘符根/桌面/文档/下载/用户目录本身）默认拒绝。
+    let (kept, rejected) = safety::filter_roots(&candidates, options.allow_risky_roots);
+    for (path, reason) in &rejected {
+        dhrust::warn!(
+            "跳过危险的监控根 {path}：{reason}（如确需监控请在客户端配置 AllowRiskyRoots = true）"
+        );
+    }
+    let roots: Vec<PathBuf> = kept.into_iter().map(PathBuf::from).collect();
     if roots.is_empty() {
-        dhrust::warn!("策略未配置有效的 WatchRoots：自动加密未启用（配置后可重启服务）");
+        dhrust::warn!("无可用监控根：自动加密未启用（需在服务端配置 WatchRoots 为安全区目录）");
         return Ok(None);
     }
 
     let base = base.to_path_buf();
     let handler_shared = Arc::clone(&shared);
+    let encrypt = options.encrypt.clone();
     let handle = watch::start(roots, DEBOUNCE, move |path| {
-        handle_change(&base, &handler_shared, &path);
+        handle_change(&base, &handler_shared, &path, &encrypt);
     })?;
     Ok(Some(handle))
 }
 
+/// 启动受控打开回写监控：临时目录内的明文改动 → 重新加密回 `.ogd`。
+fn start_session_watch(
+    base: &Path,
+    temp_dir: &Path,
+    shared: Arc<Mutex<ClientState>>,
+) -> Option<WatchHandle> {
+    if let Err(e) = std::fs::create_dir_all(temp_dir) {
+        dhrust::warn!(
+            "创建受控临时目录失败（{}）：{e}（受控打开回写不可用）",
+            temp_dir.display()
+        );
+        return None;
+    }
+    let base = base.to_path_buf();
+    match watch::start(
+        vec![temp_dir.to_path_buf()],
+        Duration::from_millis(opensession::WRITEBACK_DEBOUNCE_MS),
+        move |path| handle_session_change(&base, &shared, &path),
+    ) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            dhrust::warn!(
+                "受控打开回写监控未启动（{}）：{e}（编辑后无法自动回写）",
+                temp_dir.display()
+            );
+            None
+        }
+    }
+}
+
+/// 受控临时文件的改动处理：命中会话 → 重新加密回原容器 → 更新登记 + 审计。
+fn handle_session_change(base: &Path, shared: &Arc<Mutex<ClientState>>, path: &Path) {
+    if opensession::should_skip(path) || !path.is_file() {
+        return;
+    }
+    let sessions = opensession::load(base);
+    let Some(session) = opensession::match_session(&sessions, path).cloned() else {
+        // 不是受控打开会话（用户自己放进该目录的其它文件），不处理。
+        return;
+    };
+
+    let snapshot = match shared.lock() {
+        Ok(state) => state.clone(),
+        Err(_) => return,
+    };
+    match opensession::writeback(&snapshot, &session) {
+        Ok(opensession::Writeback::Unchanged) => {
+            // 打开文件本身也会触发 Modify（访问时间/锁文件），内容没变就不做事。
+            dhrust::debug!("受控打开内容未变，跳过回写（会话 {}）", session.session_id);
+        }
+        Ok(opensession::Writeback::Written { size, sha256 }) => {
+            let now = chrono::Utc::now().timestamp();
+            let mut updated = opensession::load(base);
+            if let Some(item) = updated
+                .iter_mut()
+                .find(|item| item.session_id == session.session_id)
+            {
+                item.writes += 1;
+                item.last_writeback = now;
+                item.last_sha256 = sha256;
+            }
+            if let Err(e) = opensession::save(base, &updated) {
+                dhrust::warn!("保存受控打开登记失败：{e}");
+            }
+            dhrust::info!(
+                "受控打开回写完成（会话 {}）：{} → {}（{size} 字节）",
+                session.session_id,
+                session.temp,
+                session.container
+            );
+            push_event(
+                shared,
+                ClientEvent {
+                    event_id: dhrust::random::hex(8),
+                    event_type: EventType::Decrypt,
+                    occurred_at: chrono::Utc::now().timestamp_millis(),
+                    path: Some(session.container.clone()),
+                    rule_id: None,
+                    user: Some(dhrust::sys::machine::user_name()),
+                    process_name: None,
+                    size: Some(size),
+                    detail: Some("受控打开编辑后回写（明文仅在受控临时目录）".to_string()),
+                },
+            );
+        }
+        Err(e) => dhrust::warn!(
+            "受控打开回写失败（会话 {}，{}）：{e}",
+            session.session_id,
+            session.container
+        ),
+    }
+}
+
 /// 单个文件变化：规则判定 → 自动加密 → 事件入队。
-fn handle_change(base: &Path, shared: &Arc<Mutex<ClientState>>, path: &Path) {
+fn handle_change(
+    base: &Path,
+    shared: &Arc<Mutex<ClientState>>,
+    path: &Path,
+    options: &ops::EncryptOptions,
+) {
     if watch::should_skip(path) {
         return;
     }
@@ -522,10 +683,18 @@ fn handle_change(base: &Path, shared: &Arc<Mutex<ClientState>>, path: &Path) {
         return;
     }
 
-    match ops::encrypt_file(&snapshot, path) {
+    match ops::encrypt_file(&snapshot, path, options) {
+        // 演练模式：记录"将会加密"，磁盘上什么都没变，也不产生审计事件。
+        Ok(outcome) if !outcome.applied => {
+            dhrust::info!(
+                "演练：命中规则 {}，将会加密 {}（未改动任何文件）",
+                outcome.rule_id,
+                path.display()
+            );
+        }
         Ok(outcome) => {
             dhrust::info!(
-                "自动加密：{} → {}（规则 {}）",
+                "自动加密：{} → {}（规则 {}，原文件已移入回收区）",
                 path.display(),
                 outcome.output.display(),
                 outcome.rule_id

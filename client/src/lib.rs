@@ -7,9 +7,13 @@
 //! - **策略只执行**：规则与策略密钥全部来自服务端；本地缓存放在 `Data/state.json`（0600）。
 
 pub mod api;
+pub mod assoc;
 pub mod config;
+pub mod opensession;
 pub mod ops;
+pub mod projfs;
 pub mod runtime;
+pub mod safety;
 pub mod service;
 pub mod state;
 pub mod watch;

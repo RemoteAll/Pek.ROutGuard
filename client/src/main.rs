@@ -1,4 +1,4 @@
-//! Pek.ROutGuard Client CLI。
+﻿//! Pek.ROutGuard Client CLI。
 //!
 //! **定位**：安装后常驻、按服务端策略自动加密；**可配置、不可停止、不可卸载**
 //! （配置入口只改"连哪个服务端、用哪个账号"，不提供暂停保护/退出/卸载；卸载需服务端令牌，M2）。
@@ -20,7 +20,7 @@ use std::process::ExitCode;
 use dhrust::logs::LogLevel;
 use pek_outguard_client::api::Api;
 use pek_outguard_client::config::{self, ClientConfig};
-use pek_outguard_client::{VERSION, base_dir, ops, runtime, service, state};
+use pek_outguard_client::{VERSION, assoc, base_dir, opensession, ops, runtime, safety, service, state};
 use pek_outguard_core::machine;
 use pek_outguard_core::protocol::{HardwareInfo, HeartbeatRequest, RegisterRequest};
 
@@ -41,6 +41,8 @@ fn main() -> ExitCode {
         Some("encrypt") => encrypt_command(&base, args.get(1).map(String::as_str)),
         Some("decrypt") => decrypt_command(&base, args.get(1..).unwrap_or(&[])),
         Some("open") => open_command(&base, args.get(1).map(String::as_str)),
+        Some("sessions") => sessions_command(&base),
+        Some("mode") => mode_command(&base, args.get(1..).unwrap_or(&[])),
         Some("install") => install_command(&base),
         Some("uninstall") => {
             uninstall_command(&base, args.iter().any(|arg| arg == "--force"))
@@ -48,6 +50,7 @@ fn main() -> ExitCode {
         Some("start") => service_action(&base, "start"),
         Some("stop") => service_action(&base, "stop"),
         Some("restart") => service_action(&base, "restart"),
+        Some(action @ ("register-assoc" | "unregister-assoc")) => assoc_command(action),
         Some("run") => run_command(&base),
         Some("-s") | Some("--service") | Some("service") => service_mode(&base),
         Some("version") | Some("--version") | Some("-version") => {
@@ -82,13 +85,20 @@ fn print_help() {
          \x20 pek-outguard-client heartbeat              发送一次心跳\n\
          \x20 pek-outguard-client encrypt <file>         按策略加密文件\n\
          \x20 pek-outguard-client decrypt <file> [--out DIR]  解密到受控目录\n\
-         \x20 pek-outguard-client open <file>            解密并用默认程序打开\n\
+         \x20 pek-outguard-client open <file>            受控打开（编辑保存后自动回写成密文）\n\
+         \x20 pek-outguard-client sessions              列出受控打开会话\n\
+         \x20 pek-outguard-client mode [show|live --confirm|dry-run]  运行模式（默认演练，不动文件）\n\
+         \x20 pek-outguard-client register-assoc        注册 .ogd 关联（双击直接打开，免管理员）\n\
+         \x20 pek-outguard-client unregister-assoc      解除 .ogd 关联\n\
          \x20 pek-outguard-client version / help\n\
          \n\
          服务化（需管理员权限）：\n\
          \x20 install / uninstall [--force] / start / stop / restart / run / status\n\
          \n\
-         说明：客户端可配置但**不可停止、不可卸载**；卸载默认需服务端允许（AllowUninstall）。"
+         说明：\n\
+         \x20 · 客户端可配置但**不可停止、不可卸载**；卸载默认需服务端允许（AllowUninstall）。\n\
+         \x20 · 日常使用请用 open（受控打开）：明文只在受控临时目录，保存后自动加密回 .ogd。\n\
+         \x20 · 需要**拿走干净明文**（外发/存档）属高危操作，需联网提交审批，不能用 open 代替。"
     );
 }
 
@@ -144,6 +154,24 @@ fn status_command(base: &Path) -> u8 {
         }
     );
     println!("待上报事件：{}", state.pending_events.len());
+    println!("受控打开会话：{} 个", opensession::load(base).len());
+    println!(
+        "运行模式：{}",
+        if section.is_dry_run() {
+            "演练（dry_run）—— 不会加密/移动/删除任何文件"
+        } else {
+            "实盘（live）—— 受控目录内文件会被真正加密"
+        }
+    );
+    println!(
+        "安全阀：危险监控根 {}",
+        if section.allow_risky_roots {
+            "已放行（AllowRiskyRoots = true，风险自负）"
+        } else {
+            "已启用（桌面/文档/下载/盘符根自动跳过）"
+        }
+    );
+    println!("原文件回收保留：{} 天", section.recovery_keep_days);
 
     // 离线状态：本地缓存策略照常生效，超宽限才拒绝解密。
     let now = chrono::Utc::now().timestamp();
@@ -179,6 +207,72 @@ fn status_command(base: &Path) -> u8 {
     );
     println!("提示：客户端不可停止、不可卸载；卸载需服务端授权。");
     0
+}
+
+/// 运行模式：演练（默认，只判定不动文件） / 实盘（真正加密）。
+fn mode_command(base: &Path, args: &[String]) -> u8 {
+    let loaded = config::load(base);
+    let mut config = loaded.value().clone();
+    match args.first().map(String::as_str) {
+        None | Some("show") => {
+            let section = &config.client;
+            println!(
+                "当前模式：{}",
+                if section.is_dry_run() {
+                    "演练（dry_run）—— 只判定并记日志，不会加密/移动/删除任何文件"
+                } else {
+                    "实盘（live）—— 受控目录内的文件会被真正加密"
+                }
+            );
+            println!("原文件回收保留：{} 天（Data/Recovery）", section.recovery_keep_days);
+            println!(
+                "危险监控根（桌面/文档/盘符根）：{}",
+                if section.allow_risky_roots {
+                    "已放行（风险自负）"
+                } else {
+                    "已禁用（默认，安全）"
+                }
+            );
+            0
+        }
+        Some("live") => {
+            if !args.iter().any(|arg| arg == "--confirm") {
+                eprintln!("切到实盘后，受控目录里的文件会被真正加密（原文件移入 Data/Recovery 保留）。");
+                eprintln!("确认无误请显式加 --confirm：pek-outguard-client mode live --confirm");
+                return 2;
+            }
+            config.client.mode = "live".to_string();
+            match config::save(base, &config) {
+                Ok(path) => {
+                    println!("已切换为实盘模式（{}）。", path.display());
+                    println!("需重启服务生效：pek-outguard-client restart");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("保存配置失败：{e}");
+                    1
+                }
+            }
+        }
+        Some("dry-run") | Some("dry_run") | Some("dryrun") => {
+            config.client.mode = "dry_run".to_string();
+            match config::save(base, &config) {
+                Ok(path) => {
+                    println!("已切回演练模式（{}）：不会改动任何文件。", path.display());
+                    println!("需重启服务生效：pek-outguard-client restart");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("保存配置失败：{e}");
+                    1
+                }
+            }
+        }
+        Some(other) => {
+            eprintln!("未知 mode：{other}（可用：show / live --confirm / dry-run）");
+            2
+        }
+    }
 }
 
 fn config_command(base: &Path, args: &[String]) -> u8 {
@@ -477,10 +571,34 @@ fn encrypt_command(base: &Path, path: Option<&str>) -> u8 {
         eprintln!("尚未同步策略（先执行 sync）");
         return 1;
     }
-    match ops::encrypt_file(&state, Path::new(path)) {
+    let section = match current_section(base) {
+        Ok(section) => section,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let options = if section.is_dry_run() {
+        println!("当前为演练模式（dry_run）：只判定，不会改动文件。实盘请用 mode live --confirm");
+        ops::EncryptOptions::default()
+    } else {
+        ops::EncryptOptions::live(safety::recovery_dir(base))
+    };
+    match ops::encrypt_file(&state, Path::new(path), &options) {
+        Ok(outcome) if !outcome.applied => {
+            println!(
+                "演练结果：将会加密 {} → {}（规则集 {} / 规则 {}，明文 {} 字节）；未改动任何文件",
+                path,
+                outcome.output.display(),
+                outcome.policy_id,
+                outcome.rule_id,
+                outcome.plain_size
+            );
+            0
+        }
         Ok(outcome) => {
             println!(
-                "已加密：{} → {}（规则集 {} / 规则 {}，明文 {} 字节）",
+                "已加密：{} → {}（规则集 {} / 规则 {}，明文 {} 字节；原文件已移入回收区）",
                 path,
                 outcome.output.display(),
                 outcome.policy_id,
@@ -555,10 +673,11 @@ fn open_command(base: &Path, path: Option<&str>) -> u8 {
     };
     let state = state::load(base);
     let temp = config::temp_dir(&section);
-    match ops::open_file(&state, Path::new(path), &temp) {
-        Ok(output) => {
-            println!("已解密并交给默认程序：{}", output.display());
-            println!("提示：受控临时目录为 {}（关闭程序后可删除）", temp.display());
+    match opensession::open(base, &state, &temp, Path::new(path)) {
+        Ok(session) => {
+            println!("已解密并交给默认程序：{}", session.temp);
+            println!("受控会话：{}", session.session_id);
+            println!("提示：{}", opensession::service_hint());
             0
         }
         Err(e) => {
@@ -568,6 +687,35 @@ fn open_command(base: &Path, path: Option<&str>) -> u8 {
     }
 }
 
+/// 列出当前的受控打开会话（明文只在受控临时目录，且会被自动回写）。
+fn sessions_command(base: &Path) -> u8 {
+    let sessions = opensession::load(base);
+    if sessions.is_empty() {
+        println!("当前无受控打开会话。");
+        return 0;
+    }
+    println!("受控打开会话 {} 个：", sessions.len());
+    for session in &sessions {
+        println!(
+            "  · [{}] {}\n      原文件：{}{}\n      打开于：{}；回写 {} 次",
+            session.session_id,
+            session.temp,
+            session.container,
+            if opensession::container_exists(session) {
+                ""
+            } else {
+            "（原文件已不存在）"
+            },
+            chrono::DateTime::from_timestamp(session.opened_at, 0)
+                .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            session.writes
+        );
+    }
+    println!("提示：{}", opensession::service_hint());
+    0
+}
+
 // ————— 服务化 —————
 
 fn install_command(base: &Path) -> u8 {
@@ -575,6 +723,11 @@ fn install_command(base: &Path) -> u8 {
         Ok(()) => {
             println!("服务已安装并启动：{}", service::SERVICE_NAME);
             println!("已设置失败恢复策略（崩溃 5s/10s/30s 自动重启）。");
+            // 双击 `.ogd` 即可受控打开（用户不需要知道“先解密”这一步）。
+            match assoc::register(&std::env::current_exe().unwrap_or_default()) {
+                Ok(()) => println!("已注册文件关联：双击 .ogd 直接打开（当前用户）。"),
+                Err(e) => println!("文件关联注册失败（不影响保护）：{e}"),
+            }
             println!("查看状态：pek-outguard-client status");
             0
         }
@@ -603,12 +756,52 @@ fn uninstall_command(base: &Path, force: bool) -> u8 {
     match service::uninstall(base) {
         Ok(()) => {
             println!("服务已卸载：{}", service::SERVICE_NAME);
+            if let Err(e) = assoc::unregister() {
+                println!("解除文件关联失败（可手动清理）：{e}");
+            }
             0
         }
         Err(e) => {
             eprintln!("卸载失败（需管理员权限）：{e}");
             1
         }
+    }
+}
+
+/// 注册 / 解除 `.ogd` 文件关联（不需要管理员：写 HKCU）。
+fn assoc_command(action: &str) -> u8 {
+    match action {
+        "register-assoc" => {
+            let exe = match std::env::current_exe() {
+                Ok(exe) => exe,
+                Err(e) => {
+                    eprintln!("取当前程序路径失败：{e}");
+                    return 1;
+                }
+            };
+            match assoc::register(&exe) {
+                Ok(()) => {
+                    println!("已注册 .ogd 关联：双击加密文件即由 OutGuard 受控打开。");
+                    println!("当前命令：{}", assoc::query().unwrap_or_else(|| "-".into()));
+                    0
+                }
+                Err(e) => {
+                    eprintln!("注册失败：{e}");
+                    1
+                }
+            }
+        }
+        "unregister-assoc" => match assoc::unregister() {
+            Ok(()) => {
+                println!("已解除 .ogd 关联。");
+                0
+            }
+            Err(e) => {
+                eprintln!("解除失败：{e}");
+                1
+            }
+        },
+        _ => 2,
     }
 }
 

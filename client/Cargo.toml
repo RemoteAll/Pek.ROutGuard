@@ -19,3 +19,13 @@ base64 = { workspace = true }
 toml = "1"
 # 文件系统事件监控（Windows ReadDirectoryChangesW / Linux inotify；纯 Rust 可交叉编译）
 notify = "6"
+
+# 透明加密视图：Windows 投影文件系统（ProjFS，Win10 1809+/Server 2019+ 内置，**纯用户态**）
+# 提供 virtualization root 回调（枚举/占位/数据/写入），不需要驱动与代码签名。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_ProjectedFileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }

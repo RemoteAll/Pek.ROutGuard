@@ -15,3 +15,16 @@ TempDir = ""
 WatchRoots = []
 # 审计事件上报间隔（秒）
 ReportIntervalSecs = 30
+
+# ————— 安全阀（调试/试点阶段务必保持默认）—————
+# 运行模式：
+#   dry_run = 演练（默认）：只按规则判定并记日志，**不会加密、不会移动、不会删除任何文件**
+#   live    = 实盘：受控目录内的文件会被真正加密，原文件移入 Data/Recovery 保留
+# 切换方式（需显式确认）：pek-outguard-client mode live --confirm
+Mode = "dry_run"
+# 加密成功后原文件的回收保留天数（0 = 直接删除，强烈不推荐）
+# 实盘模式下原文件先移到 Data/Recovery/<日期>/，到期才清理，出问题能拿回来
+RecoveryKeepDays = 7
+# 是否允许把「桌面 / 文档 / 下载 / 用户目录本身 / 盘符根 / 系统目录」作为监控根
+# false（默认）= 这些目录会被自动跳过并告警；改成 true 等于同意"可能加密个人全部资料"
+AllowRiskyRoots = false
