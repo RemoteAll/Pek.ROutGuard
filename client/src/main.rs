@@ -588,7 +588,11 @@ fn heartbeat_command(base: &Path) -> u8 {
     match api.heartbeat(&state.client_id.clone(), &state.client_token.clone(), &request) {
         Ok(response) => {
             state.last_heartbeat = now_text();
-            let _ = state::save(base, &state);
+            // 保存失败必须留痕：否则下次启动看到的 last_heartbeat 是旧的，
+            // 运维会误判“心跳一直没成功”。
+            if let Err(e) = state::save(base, &state) {
+                dhrust::warn!("心跳成功但状态保存失败（{}）：{e}", base.display());
+            }
             println!(
                 "心跳成功：期望策略版本={} 指令={:?}",
                 response.policy_version, response.commands

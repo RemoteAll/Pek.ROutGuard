@@ -973,8 +973,17 @@ fn load_or_create_instance_id(vault: &Path) -> windows_sys::core::GUID {
         };
     }
     let bytes = dhrust::random::bytes(16);
-    let _ = std::fs::create_dir_all(vault);
-    let _ = std::fs::write(&path, &bytes);
+    if let Err(e) = std::fs::create_dir_all(vault) {
+        dhrust::warn!("创建密文库目录失败（{}）：{e}", vault.display());
+    }
+    // 写失败不致命（下次会重新生成），但必须留痕：GUID 一变，
+    // 已存在的占位符就与虚拟化实例不匹配，安全区会起不来。
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        dhrust::warn!(
+            "写入 ProjFS instance-id 失败（{}）：{e}；重启后占位符可能无法识别",
+            path.display()
+        );
+    }
     windows_sys::core::GUID {
         data1: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
         data2: u16::from_le_bytes([bytes[4], bytes[5]]),

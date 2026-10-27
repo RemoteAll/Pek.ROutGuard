@@ -1014,7 +1014,14 @@ fn handle_change(
                 },
             );
             if let Ok(state) = shared.lock() {
-                let _ = state::save(base, &state);
+                // 这里保存的是“待上报事件队列”。保存失败 = 加密事件可能丢失 = 审计不完整，
+                // 必须告警，绝不能静默忽略。
+                if let Err(e) = state::save(base, &state) {
+                    dhrust::warn!(
+                        "自动加密事件已产生但状态保存失败（{}）：{e}；该事件可能在重启后丢失",
+                        base.display()
+                    );
+                }
             }
         }
         Err(e) => dhrust::warn!("自动加密失败（{}）：{e}", path.display()),
