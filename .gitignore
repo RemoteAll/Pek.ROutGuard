@@ -11,3 +11,10 @@
 # 本地覆盖配置（模板必须入库）
 Config/*.local.toml
 Config/*.local.json
+
+# 驱动编译产物（.sys/.obj 不入库；证书私钥绝不入库）
+/driver/build/
+*.sys
+*.obj
+*.pfx
+*.cer
