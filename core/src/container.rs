@@ -353,9 +353,111 @@ pub fn decrypt_stream<R: Read, W: Write>(
     })
 }
 
+/// 只解密 `[offset, offset + length)` 这一段明文，返回实际写出的字节数。
+///
+/// 用途：虚拟文件系统（ProjFS）按需供数——应用读 4 KB 就只解一个分块，
+/// **不把整个文件读进内存，也不在磁盘上留明文缓存**。
+/// 所有分块的 AAD 都绑定头部哈希，所以跨块读取同样能校验出篡改。
+pub fn decrypt_range(
+    path: &std::path::Path,
+    kek: &[u8; KEY_LEN],
+    offset: u64,
+    length: u64,
+    out: &mut Vec<u8>,
+) -> Result<u64> {
+    use std::io::{BufReader, Seek, SeekFrom};
+
+    if length == 0 {
+        return Ok(0);
+    }
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+
+    let mut fixed = [0u8; 12];
+    read_exact(&mut reader, &mut fixed, "容器头")?;
+    if fixed[..4] != MAGIC {
+        return Err(Error::Format("不是 OutGuard 容器（魔数不匹配）".into()));
+    }
+    let version = u16::from_le_bytes([fixed[4], fixed[5]]);
+    if version != FORMAT_VERSION {
+        return Err(Error::Format(format!(
+            "不支持的容器版本：{version}（本程序支持 {FORMAT_VERSION}）"
+        )));
+    }
+    let header_len = u32::from_le_bytes([fixed[8], fixed[9], fixed[10], fixed[11]]);
+    if header_len == 0 || header_len > MAX_HEADER_LEN {
+        return Err(Error::Format(format!("头部长度非法：{header_len}")));
+    }
+    let mut header_json = vec![0u8; header_len as usize];
+    read_exact(&mut reader, &mut header_json, "头部 JSON")?;
+    let header_hash = crypto::sha256(&header_json);
+
+    let mut len_buf = [0u8; 4];
+    read_exact(&mut reader, &mut len_buf, "KeyBlock 长度")?;
+    let key_block_len = u32::from_le_bytes(len_buf);
+    let expected_key_block = (crypto::GCM_NONCE_LEN + KEY_LEN + GCM_TAG_LEN) as u32;
+    if key_block_len != expected_key_block {
+        return Err(Error::Format(format!(
+            "KeyBlock 长度非法：{key_block_len}（期望 {expected_key_block}）"
+        )));
+    }
+    let mut key_block = vec![0u8; key_block_len as usize];
+    read_exact(&mut reader, &mut key_block, "KeyBlock")?;
+    let dek = crypto::unwrap_key(kek, &key_block, &header_hash)?;
+
+    read_exact(&mut reader, &mut len_buf, "分块大小")?;
+    let chunk_size = u32::from_le_bytes(len_buf);
+    if chunk_size == 0 || chunk_size > MAX_CHUNK_SIZE {
+        return Err(Error::Format(format!("分块大小非法：{chunk_size}")));
+    }
+    let mut nonce_prefix = [0u8; 8];
+    read_exact(&mut reader, &mut nonce_prefix, "nonce 前缀")?;
+
+    // 除最后一块外，每块在磁盘上占 `4 + chunk_size + 16` 字节，可直接定位。
+    let data_start = 12 + header_len as u64 + 4 + key_block_len as u64 + 4 + 8;
+    let slot = 4 + chunk_size as u64 + GCM_TAG_LEN as u64;
+    let first = offset / chunk_size as u64;
+    let mut index = first;
+    if first > 0 {
+        reader
+            .seek(SeekFrom::Start(data_start + first * slot))
+            .map_err(|e| Error::Format(format!("定位分块失败：{e}")))?;
+    }
+    let mut skip = offset % chunk_size as u64; // 第一块内要跳过的明文字节
+    let mut want = length;
+    let mut produced: u64 = 0;
+    let mut cipher_buf = vec![0u8; chunk_size as usize + GCM_TAG_LEN];
+
+    while want > 0 {
+        read_exact(&mut reader, &mut len_buf, "分块长度")?;
+        let cipher_len = u32::from_le_bytes(len_buf);
+        if cipher_len == 0 {
+            break; // END：说明 offset 已越过明文末尾
+        }
+        if cipher_len < GCM_TAG_LEN as u32 || cipher_len > chunk_size + GCM_TAG_LEN as u32 {
+            return Err(Error::Format(format!("分块长度非法：{cipher_len}")));
+        }
+        let size = cipher_len as usize;
+        read_exact(&mut reader, &mut cipher_buf[..size], "分块密文")?;
+        let nonce = crypto::chunk_nonce(&nonce_prefix, index);
+        let plain = crypto::decrypt_chunk(&dek, &nonce, &cipher_buf[..size], &header_hash)?;
+
+        let begin = skip.min(plain.len() as u64) as usize;
+        let take = ((plain.len() as u64 - begin as u64).min(want)) as usize;
+        out.extend_from_slice(&plain[begin..begin + take]);
+        produced += take as u64;
+        want -= take as u64;
+        skip = 0;
+        index += 1;
+        if (plain.len() as u64) < chunk_size as u64 {
+            break; // 最后一块
+        }
+    }
+    Ok(produced)
+}
+
 /// 循环读满缓冲区；返回实际读到的字节数（0 = EOF）。
-fn read_full<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<usize> {
-    let mut filled = 0usize;
+fn read_full<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<usize> {    let mut filled = 0usize;
     while filled < buffer.len() {
         match reader.read(&mut buffer[filled..]) {
             Ok(0) => break,
@@ -512,6 +614,72 @@ mod tests {
         let data = vec![0x5Au8; 4096 + 7];
         let summary = roundtrip(&data, 1024);
         assert_eq!(summary.plain_size, data.len() as u64);
+    }
+
+    /// 写一个容器到临时文件，返回路径（测试结束自行删除）。
+    fn write_container(plain: &[u8], chunk_size: u32) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ogd-range-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("建目录");
+        let path = dir.join("a.bin.ogd");
+        let mut input = Cursor::new(plain.to_vec());
+        let mut out = Vec::new();
+        encrypt_stream_with_chunk(&kek(), &test_header(), chunk_size, &mut input, &mut out)
+            .expect("加密成功");
+        std::fs::write(&path, &out).expect("落盘");
+        path
+    }
+
+    #[test]
+    fn range_decrypts_only_requested_bytes() {
+        // 5 块 + 半块：0..=1023 值随下标变化，便于校验偏移
+        let plain: Vec<u8> = (0..5123u32).map(|i| (i % 251) as u8).collect();
+        let path = write_container(&plain, 1024);
+
+        // 对齐起点、跨块、未对齐起点、单个字节、尾部不足一块
+        for (offset, length) in [
+            (0u64, 1024u64),
+            (0, 5123),
+            (1000, 100),     // 跨块 + 未对齐
+            (1023, 3),       // 块边界上跨 3 字节
+            (5122, 1),       // 最后一个字节
+            (5000, 9999),    // 请求超过文件末尾
+            (5123, 10),      // 完全越界
+        ] {
+            let mut out = Vec::new();
+            let got = decrypt_range(&path, &kek(), offset, length, &mut out).expect("区间解密");
+            let begin = offset.min(plain.len() as u64) as usize;
+            let end = ((offset + length) as usize).min(plain.len());
+            let expect = &plain[begin..end];
+            assert_eq!(out, expect, "offset={offset} length={length} 内容不一致");
+            assert_eq!(got, expect.len() as u64);
+        }
+        let _ = std::fs::remove_dir_all(path.parent().expect("父目录"));
+    }
+
+    #[test]
+    fn range_decrypt_rejects_tampered_chunk() {
+        let plain = vec![0x33u8; 4096];
+        let path = write_container(&plain, 1024);
+        // 翻转最后一个分块里的一个字节
+        let mut bytes = std::fs::read(&path).expect("读容器");
+        let last = bytes.len() - FOOTER_LEN - 10;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&path, &bytes).expect("写回");
+
+        let mut out = Vec::new();
+        let err = decrypt_range(&path, &kek(), 3000, 100, &mut out).expect_err("篡改必须被发现");
+        assert!(
+            format!("{err}").contains("解密") || format!("{err}").contains("校验"),
+            "错误信息应指向解密/校验失败，实际：{err}"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("父目录"));
     }
 
     #[test]

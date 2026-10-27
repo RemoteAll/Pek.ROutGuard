@@ -711,22 +711,70 @@ fn start_secure_areas(
         };
 
         // 保存后落盘加密：ProjFS 会先落成实体明文，这里立刻搬进密文库。
-        let seal_area = Arc::clone(&area);
-        let seal_watch = watch::start(
-            vec![root.clone()],
-            Duration::from_millis(1500),
-            move |_path: PathBuf| {
-                seal_area.seal_dirty();
-            },
-        )
-        .map_err(|e| dhrust::warn!("安全区 {root_text} 落盘加密监控未启动：{e}"))
-        .ok();
+        let seal_watch = attach_seal_watch(&area, &root);
 
         dhrust::info!("安全区已就绪（透明加密）：{root_text}");
         running.push((area, seal_watch));
     }
     running
 }
+
+/// 给安全区挂上“保存即加密”的文件监控（**命令行与服务共用，不要再各写一份**）。
+///
+/// 只处理发生变化的那一个文件，不做全盘扫描——大目录下保存也不会卡。
+pub fn attach_seal_watch(
+    area: &Arc<secure_area::SecureArea>,
+    root: &Path,
+) -> Option<WatchHandle> {
+    spawn_dehydrate_worker(area);
+    let seal_area = Arc::clone(area);
+    let root_for_watch = root.to_path_buf();
+    match watch::start(
+        vec![root.to_path_buf()],
+        Duration::from_millis(1500),
+        move |path: PathBuf| {
+            // ProjFS 自己也会有噪音事件（hydrate/占位符状态），seal_path 内部会过滤。
+            if !path.starts_with(&root_for_watch) {
+                return;
+            }
+            seal_area.seal_path(&path);
+        },
+    ) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            dhrust::warn!(
+                "安全区 {} 落盘加密监控未启动：{e}（保存后可能残留明文，可用 secure-area run 重启）",
+                root.display()
+            );
+            None
+        }
+    }
+}
+
+/// 空闲脱水：打开过的文件在 `DEHYDRATE_IDLE` 内没再被读，就降级回占位符。
+///
+/// 这是“读完之后磁盘上不留明文”的收口——ProjFS 会把解密结果落在本地，
+/// 不脱水就等于把明文留在磁盘上。**只遍历内存表，不扫目录**，开销可忽略。
+pub fn spawn_dehydrate_worker(area: &Arc<secure_area::SecureArea>) {
+    let weak = Arc::downgrade(area);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(DEHYDRATE_TICK);
+            let Some(area) = weak.upgrade() else {
+                return; // 安全区关闭，线程退出
+            };
+            let count = area.dehydrate_idle(DEHYDRATE_IDLE);
+            if count > 0 {
+                dhrust::info!("空闲脱水完成：{count} 个文件已恢复为占位符（磁盘上不再留明文）");
+            }
+        }
+    });
+}
+
+/// 空闲脱水的巡检周期（内存比对，不读盘）。
+const DEHYDRATE_TICK: Duration = Duration::from_secs(5);
+/// 文件多久没被读就把明文从磁盘上收回（用户还在用时不会被抽走）。
+const DEHYDRATE_IDLE: Duration = Duration::from_secs(60);
 
 /// 启动受控打开回写监控：临时目录内的明文改动 → 重新加密回 `.ogd`。
 fn start_session_watch(

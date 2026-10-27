@@ -41,7 +41,6 @@ use windows_sys::Win32::Storage::ProjectedFileSystem::{
 
 const S_OK: i32 = 0;
 const E_FAIL: i32 = 0x8000_4005u32 as i32;
-const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
 const HR_FILE_NOT_FOUND: i32 = 0x8007_0002u32 as i32;
 
 /// `PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN`
@@ -156,12 +155,10 @@ unsafe impl Send for SecureArea {}
 unsafe impl Sync for SecureArea {}
 
 impl SecureArea {
-    /// 把安全区里的**实体明文文件**加密搬进密文库，并恢复成占位符。
+    /// 全量清扫安全区里的实体明文（启动兜底/手工触发），返回处理数。
     ///
-    /// ProjFS 的写入是"落成本地实体文件"，所以每次用户保存后都要走这一步，
-    /// 否则磁盘上会留下明文。返回处理的文件数。
+    /// **正常运行不走这里**——文件监控会精准告诉自己哪个文件变了（见 [`Self::seal_path`]）。
     pub fn seal_dirty(&self) -> usize {
-        let inner = unsafe { &*self.inner };
         let mut sealed = 0usize;
         let mut stack = vec![self.options.root.clone()];
         while let Some(dir) = stack.pop() {
@@ -178,9 +175,13 @@ impl SecureArea {
                 if is_placeholder(&meta) {
                     continue;
                 }
-                match self.seal_one(inner, &path) {
+                // 启动清扫必须“扫到就处理完”，不能沿用 seal_path 的时间窗跳过。
+                match self.seal_one(unsafe { &*self.inner }, &path, true) {
                     Ok(()) => sealed += 1,
-                    Err(e) => dhrust::warn!("安全区落盘加密失败（{}）：{e}", path.display()),
+                    Err(e) => dhrust::warn!(
+                        "启动清扫加密失败（{}）：{e}（明文已保留，稍后重试）",
+                        path.display()
+                    ),
                 }
             }
         }
@@ -190,7 +191,109 @@ impl SecureArea {
         sealed
     }
 
-    fn seal_one(&self, inner: &Inner, path: &Path) -> Result<(), String> {
+    /// 处理**单个**文件的落盘加密（精准路径，不全盘扫描）。
+    ///
+    /// 返回 `true` 表示确实做了加密；占位符、目录、失效路径、刚看过的同一版本文件返回 `false`。
+    pub fn seal_path(&self, path: &Path) -> bool {
+        let inner = unsafe { &*self.inner };
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        if meta.is_dir() || is_placeholder(&meta) {
+            return false;
+        }
+        let relative = path
+            .strip_prefix(&self.options.root)
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        // 打开文件（hydrate）也会产生 Modify 事件；大小和 mtime 都没变时
+        // 不可能有新内容，直接跳过——否则读 300 MB 要白算十几次哈希。
+        if !relative.is_empty()
+            && let Ok(mut recent) = inner.recent.lock()
+        {
+            if let Some((size, at, stamp)) = recent.get(&relative)
+                && *size == meta.len()
+                && *at == mtime
+                && stamp.elapsed() < std::time::Duration::from_secs(5)
+            {
+                return false;
+            }
+            if recent.len() > 4000 {
+                recent.clear();
+            }
+            recent.insert(
+                relative.clone(),
+                (meta.len(), mtime, std::time::Instant::now()),
+            );
+        }
+        match self.seal_one(inner, path, false) {
+            Ok(()) => true,
+            Err(e) => {
+                dhrust::warn!("安全区落盘加密失败（{}）：{e}", path.display());
+                false
+            }
+        }
+    }
+
+    /// 把**已水化（磁盘上已有明文）且已经空闲**的文件降级回占位符。
+    ///
+    /// ProjFS 的 hydrate 会在本地留下真实数据；应用关掉文件后这些明文没必要留着。
+    /// 这里只处理"自己读过的文件"（内存表，几 KB），**不扫目录**。
+    /// 返回处理的文件数。
+    ///
+    /// 关键：**绝不丢用户改动**——走的仍是 [`Self::seal_one`]，
+    /// 内容与密文库一致才纯降级，不一致会先加密落库再降级。
+    pub fn dehydrate_idle(&self, idle: std::time::Duration) -> usize {
+        let inner = unsafe { &*self.inner };
+        let due: Vec<String> = {
+            let Ok(mut hydrated) = inner.hydrated.lock() else {
+                return 0;
+            };
+            let now = std::time::Instant::now();
+            let mut due = Vec::new();
+            hydrated.retain(|relative, at| {
+                if now.duration_since(*at) >= idle {
+                    due.push(relative.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            due
+        };
+        let mut count = 0usize;
+        for relative in due {
+            let path = self.options.root.join(&relative);
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() || is_placeholder(&meta) {
+                continue;
+            }
+            match self.seal_one(inner, &path, true) {
+                Ok(()) => {
+                    count += 1;
+                    // seal_one 成功后 hydrated 已被清掉，这里无需再动。
+                }
+                Err(e) => {
+                    // 失败就把文件重新放回队列，下个周期再试（不丢改动）。
+                    dhrust::warn!("空闲脱水失败（{relative}）：{e}（稍后重试）");
+                    if let Ok(mut hydrated) = inner.hydrated.lock() {
+                        hydrated.insert(relative, std::time::Instant::now());
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    fn seal_one(&self, inner: &Inner, path: &Path, demote_clean: bool) -> Result<(), String> {
         let relative = path
             .strip_prefix(&self.options.root)
             .map_err(|e| format!("计算相对路径失败：{e}"))?
@@ -201,8 +304,11 @@ impl SecureArea {
         }
         let key = (inner.key)(&self.options.policy_id)
             .ok_or_else(|| format!("策略密钥不可用（policyId={}）", self.options.policy_id))?;
-        let plain = std::fs::read(path).map_err(|e| format!("读取实体文件失败：{e}"))?;
-        let plain_hash = pek_outguard_core::crypto::sha256(&plain);
+        let meta = std::fs::metadata(path).map_err(|e| format!("读取实体文件信息失败：{e}"))?;
+        let plain_size = meta.len();
+        // 流式哈希：几百 MB 的 CAD 也只用一个 256 KB 缓冲，不会把进程撑爆。
+        let plain_hash =
+            pek_outguard_core::crypto::sha256_file(path).map_err(|e| format!("计算明文哈希失败：{e}"))?;
         let name = path
             .file_name()
             .map(|value| value.to_string_lossy().to_string())
@@ -225,7 +331,19 @@ impl SecureArea {
             }
         };
         if unchanged {
-            demote_to_placeholder(self.context, &relative, path, plain.len() as i64)?;
+            if demote_clean {
+                demote_to_placeholder(self.context, &relative, path, plain_size as i64)?;
+            } else {
+                // **不在水化时立刻降级**：那个“改动”只是 ProjFS 把数据召回本地，
+                // 立刻回收会让应用下一口气又去召回（读大文件会剧烈抖动）。
+                // 记下来，交给空闲脱水（默认 60 s 没再读就收回明文）。
+                if let Ok(mut hydrated) = inner.hydrated.lock() {
+                    if hydrated.len() > 4000 {
+                        hydrated.clear();
+                    }
+                    hydrated.insert(relative.clone(), std::time::Instant::now());
+                }
+            }
             if let Ok(mut sealed) = inner.sealed.lock() {
                 sealed.insert(relative.clone(), plain_hash);
             }
@@ -243,25 +361,26 @@ impl SecureArea {
             client_id: String::new(),
             created_at: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
             original_name: name,
-            original_size: plain.len() as u64,
-            plain_sha256: Some(pek_outguard_core::crypto::hex(
-                &pek_outguard_core::crypto::sha256(&plain),
-            )),
+            original_size: plain_size,
+            plain_sha256: Some(pek_outguard_core::crypto::hex(&plain_hash)),
         };
 
-        // ① 先写密文（同目录 .tmp 再改名）
+        // ① 先写密文（同目录 .tmp 再改名）；输入直接来自文件句柄，全程流式。
         if let Some(parent) = vault_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建密文库目录失败：{e}"))?;
         }
         let temp = vault_path.with_extension(format!("{VAULT_EXT}.tmp"));
         {
-            let mut input = std::io::Cursor::new(&plain);
+            let mut input =
+                std::fs::File::open(path).map_err(|e| format!("打开实体明文失败：{e}"))?;
             let mut out = std::fs::File::create(&temp)
                 .map_err(|e| format!("创建密文失败（{}）：{e}", temp.display()))?;
             pek_outguard_core::container::encrypt_stream(&key, &header, &mut input, &mut out)
                 .map_err(|e| format!("加密失败：{e}"))?;
         }
-        std::fs::rename(&temp, &vault_path).map_err(|e| {
+        // 用原子替换而不是裸 rename：杀软/备份/其他读取器恰好占着目标文件时，
+        // 裸 rename 会 “拒绝访问” 直接失败（明文就得下次再试）；原子替换带重试。
+        dhrust::io::safe_replace_file(&temp, &vault_path).map_err(|e| {
             let _ = std::fs::remove_file(&temp);
             format!("落位密文失败：{e}")
         })?;
@@ -274,10 +393,9 @@ impl SecureArea {
 
         // ② 让 ProjFS 把这个“实体明文文件”抷回占位符（按 flags 允许丢弃本地数据）。
         //    注意：不能先删再 PrjWritePlaceholderInfo——ProjFS 的目录缓存会把它当成已删除。
-        demote_to_placeholder(self.context, &relative, path, plain.len() as i64)?;
-        // 容器变了 → 缓存失效
-        if let Ok(mut cache) = inner.cache.lock() {
-            cache.remove(&relative);
+        demote_to_placeholder(self.context, &relative, path, plain_size as i64)?;
+        if let Ok(mut hydrated) = inner.hydrated.lock() {
+            hydrated.remove(&relative);
         }
         if let Ok(mut sealed) = inner.sealed.lock() {
             if sealed.len() > 4000 {
@@ -286,8 +404,12 @@ impl SecureArea {
             sealed.insert(relative.clone(), plain_hash);
         }
         if let Some(sink) = &self.options.audit {
-            (sink)("seal", &relative, Some(plain.len() as u64));
+            (sink)("seal", &relative, Some(plain_size));
         }
+        dhrust::info!(
+            "已加密落盘：{relative}（{} 字节）；磁盘上只留密文",
+            plain_size
+        );
         Ok(())
     }
 }
@@ -306,7 +428,7 @@ fn demote_to_placeholder(
     full_path: &Path,
     size: i64,
 ) -> Result<(), String> {
-    let info = placeholder_for(false, size);
+    let info = placeholder_for(false, size, dehydrate_seed());
     let name_wide = wide(relative);
     let mut cause: i32 = 0;
     let hr = unsafe {
@@ -344,6 +466,16 @@ fn demote_to_placeholder(
 /// ProjFS 占位符带"数据按需召回"属性；实体文件没有。
 const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
 
+/// 脱水时给 ContentID 换个新值：内容标识变了，ProjFS 才会把本地明文收回去。
+/// （内容没变时若沿用同一个 ContentID，系统会认为“无需更新”，文件就一直留着明文。）
+fn dehydrate_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1)
+}
+
 fn is_placeholder(meta: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     meta.file_attributes() & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0
@@ -356,6 +488,8 @@ impl Drop for SecureArea {
             // 等回调线程退出后释放上下文。
             drop(Box::from_raw(self.inner as *mut Inner));
         }
+        // 安全第一：停用时清掉明文缓存（不把解密结果留在磁盘上）。
+        let _ = std::fs::remove_dir_all(&self.options.cache);
         dhrust::info!("安全区已停止：{}", self.options.root.display());
     }
 }
@@ -366,18 +500,15 @@ struct Inner {
     key: Arc<KeyResolver>,
     /// 枚举会话：枚举 GUID → 待派发的条目列表
     enumerations: Mutex<HashMap<String, Vec<Entry>>>,
-    /// 解密缓存：相对路径 → 明文内容（容器 mtime 变化就重建）
-    cache: Mutex<HashMap<String, Arc<CachedPlain>>>,
+    /// 已水化（ProjFS 已经把明文落在本地磁盘）的文件：相对路径 → 最后一次读取时间。
+    /// 空闲后统一降级为占位符，避免明文长期留在磁盘上。
+    hydrated: Mutex<HashMap<String, std::time::Instant>>,
+    /// 刚看过的文件（大小 + mtime）：重复事件直接跳过，避免重复哈希大文件
+    recent: Mutex<HashMap<String, (u64, i64, std::time::Instant)>>,
     /// 打开审计去重：相对路径 → 最近一次记录时间（同一文件 5 分钟内只记一条）
     opened: Mutex<HashMap<String, std::time::Instant>>,
     /// 上次落盘加密时的明文 SHA-256：内容没变就不重复加密（ProjFS 会反复触发 Modify）
     sealed: Mutex<HashMap<String, [u8; 32]>>,
-}
-
-struct CachedPlain {
-    /// 容器修改时间（失效判定）
-    stamp: (u64, i64),
-    data: Vec<u8>,
 }
 
 /// 目录枚举项。
@@ -406,43 +537,37 @@ impl Inner {
         Some(header.original_size as i64)
     }
 
-    /// 取明文（带缓存）。
-    fn plain(&self, relative: &str) -> Option<Arc<CachedPlain>> {
+    /// 按需解密 `[offset, offset+length)` 这一段明文。
+    ///
+    /// **不落明文缓存、不把整文件读进内存**：应用读 4 KB 就只解一个分块，
+    /// 几百 MB 的图纸也只占几 MB 内存。
+    fn plain_range(&self, relative: &str, offset: u64, length: u64) -> Option<Vec<u8>> {
         let path = self.vault_path(relative);
-        let meta = std::fs::metadata(&path).ok()?;
-        let stamp = (
-            meta.len(),
-            meta.modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
-        );
-        if let Ok(cache) = self.cache.lock()
-            && let Some(hit) = cache.get(relative)
-            && hit.stamp == stamp
-        {
-            return Some(Arc::clone(hit));
-        }
-
-        // 缓存未命中：整文件解密（第一版；大文件后续按需分块）。
-        let key = {
-            let mut reader = std::io::BufReader::new(std::fs::File::open(&path).ok()?);
-            let header = pek_outguard_core::container::read_header(&mut reader).ok()?;
-            (self.key)(&header.policy_id)?
-        };
         let mut reader = std::io::BufReader::new(std::fs::File::open(&path).ok()?);
-        let mut data = Vec::new();
-        let mut out = std::io::Cursor::new(&mut data);
-        pek_outguard_core::container::decrypt_stream(&key, &mut reader, &mut out).ok()?;
-
-        let entry = Arc::new(CachedPlain { stamp, data });
-        if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(relative.to_string(), Arc::clone(&entry));
+        let header = pek_outguard_core::container::read_header(&mut reader)
+            .inspect_err(|e| dhrust::warn!("安全区读容器头失败（{relative}）：{e}"))
+            .ok()?;
+        let key = (self.key)(&header.policy_id)?;
+        let mut out = Vec::with_capacity(length.min(4 * 1024 * 1024) as usize);
+        let size = pek_outguard_core::container::decrypt_range(
+            &path,
+            &key,
+            offset,
+            length,
+            &mut out,
+        )
+        .inspect_err(|e| dhrust::warn!("安全区解密失败（{relative} @{offset}）：{e}"))
+        .ok()?;
+        if size > 0
+            && let Ok(mut hydrated) = self.hydrated.lock()
+        {
+            if hydrated.len() > 4000 {
+                hydrated.clear();
+            }
+            hydrated.insert(relative.to_string(), std::time::Instant::now());
         }
-        // 审计：同一文件 5 分钟内只记一条（避免流式读触发几十条重复事件）。
-        self.audit_open(relative, entry.data.len() as u64);
-        Some(entry)
+        self.audit_open(relative, header.original_size);
+        Some(out)
     }
 
     fn audit_open(&self, relative: &str, size: u64) {
@@ -532,13 +657,18 @@ pub fn start(options: SecureAreaOptions, key: Arc<KeyResolver>) -> Result<Secure
         ));
     }
     std::fs::create_dir_all(&options.vault).map_err(|e| format!("创建密文库失败：{e}"))?;
-    std::fs::create_dir_all(&options.cache).map_err(|e| format!("创建缓存目录失败：{e}"))?;
+    // 旧版会把解密结果写在 `options.cache` 目录里——新版改成按需区间解密，
+    // 这里只做一次性清理（不留历史明文残留），不再创建这个目录。
+    if options.cache.is_dir() {
+        let _ = std::fs::remove_dir_all(&options.cache);
+    }
 
     let inner = Box::into_raw(Box::new(Inner {
         options: options.clone(),
         key,
         enumerations: Mutex::new(HashMap::new()),
-        cache: Mutex::new(HashMap::new()),
+        hydrated: Mutex::new(HashMap::new()),
+        recent: Mutex::new(HashMap::new()),
         opened: Mutex::new(HashMap::new()),
         sealed: Mutex::new(HashMap::new()),
     }));
@@ -712,7 +842,7 @@ unsafe extern "system" fn cb_placeholder(data: *const PRJ_CALLBACK_DATA) -> i32 
 
     // 子目录：密文库里有同名目录就当成目录占位符。
     if inner.vault_dir(&path).is_dir() {
-        let placeholder = placeholder_for(true, 0);
+        let placeholder = placeholder_for(true, 0, 0);
         let name_wide = wide(&path);
         let hr = unsafe {
             PrjWritePlaceholderInfo(
@@ -728,7 +858,7 @@ unsafe extern "system" fn cb_placeholder(data: *const PRJ_CALLBACK_DATA) -> i32 
     let Some(size) = inner.file_size(&path) else {
         return HR_FILE_NOT_FOUND;
     };
-    let placeholder = placeholder_for(false, size);
+    let placeholder = placeholder_for(false, size, 0);
     let name_wide = wide(&path);
     let hr = unsafe {
         PrjWritePlaceholderInfo(
@@ -750,25 +880,23 @@ unsafe extern "system" fn cb_file_data(
     let Some(path) = (unsafe { rel_path(data) }) else {
         return HR_FILE_NOT_FOUND;
     };
-    let Some(plain) = inner.plain(&path) else {
+    if length == 0 {
+        return S_OK;
+    }
+    // 按需区间解密：只解这段字节，**不落明文缓存、不把整文件读进内存**。
+    let Some(plain) = inner.plain_range(&path, byte_offset, length as u64) else {
         return HR_FILE_NOT_FOUND;
     };
-    let start = byte_offset as usize;
-    if start > plain.data.len() {
-        return E_INVALIDARG;
-    }
-    let end = (start + length as usize).min(plain.data.len());
-    let slice = &plain.data[start..end];
-    if slice.is_empty() {
+    if plain.is_empty() {
         return S_OK;
     }
     let hr = unsafe {
         PrjWriteFileData(
             (*data).NamespaceVirtualizationContext,
             &(*data).DataStreamId,
-            slice.as_ptr() as *const c_void,
+            plain.as_ptr() as *const c_void,
             byte_offset,
-            slice.len() as u32,
+            plain.len() as u32,
         )
     };
     if hr < 0 { hr } else { S_OK }
@@ -891,7 +1019,9 @@ fn dir_basic_info() -> PRJ_FILE_BASIC_INFO {
     }
 }
 
-fn placeholder_for(is_dir: bool, size: i64) -> PRJ_PLACEHOLDER_INFO {
+fn placeholder_for(is_dir: bool, size: i64, seed: u64) -> PRJ_PLACEHOLDER_INFO {
+    let mut content_id = [0u8; 128];
+    content_id[..8].copy_from_slice(&seed.to_le_bytes());
     PRJ_PLACEHOLDER_INFO {
         FileBasicInfo: if is_dir {
             dir_basic_info()
@@ -914,7 +1044,7 @@ fn placeholder_for(is_dir: bool, size: i64) -> PRJ_PLACEHOLDER_INFO {
             },
         VersionInfo: PRJ_PLACEHOLDER_VERSION_INFO {
             ProviderID: [0u8; 128],
-            ContentID: [0u8; 128],
+            ContentID: content_id,
         },
         VariableData: [0u8; 1],
     }
@@ -1102,7 +1232,8 @@ mod tests {
             },
             key: Arc::new(|_| Some([0u8; 32])),
             enumerations: Mutex::new(HashMap::new()),
-            cache: Mutex::new(HashMap::new()),
+            hydrated: Mutex::new(HashMap::new()),
+            recent: Mutex::new(HashMap::new()),
             opened: Mutex::new(HashMap::new()),
             sealed: Mutex::new(HashMap::new()),
         };

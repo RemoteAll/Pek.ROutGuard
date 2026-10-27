@@ -29,6 +29,22 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// 流式计算文件 SHA-256（**大文件不占内存**；几百 MB 的 CAD 也只用一个 256 KB 缓冲）。
+pub fn sha256_file(path: &std::path::Path) -> Result<[u8; 32]> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(Error::Io)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(Error::Io)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
 /// 小写十六进制编码（签名载荷/事件 ID 用）。
 pub fn hex(bytes: &[u8]) -> String {
     const TABLE: &[u8; 16] = b"0123456789abcdef";

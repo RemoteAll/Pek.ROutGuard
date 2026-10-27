@@ -21,7 +21,7 @@ use dhrust::logs::LogLevel;
 use pek_outguard_client::api::Api;
 use pek_outguard_client::config::{self, ClientConfig};
 use pek_outguard_client::{
-    VERSION, assoc, base_dir, opensession, ops, projfs, runtime, safety, secure_area, service, state, watch,
+    VERSION, assoc, base_dir, opensession, ops, projfs, runtime, safety, secure_area, service, state,
 };
 use pek_outguard_core::machine;
 use pek_outguard_core::protocol::{HardwareInfo, HeartbeatRequest, RegisterRequest};
@@ -901,25 +901,9 @@ fn secure_area_command(base: &Path, args: &[String]) -> u8 {
             };
 
             // 写入落盘加密：用户保存后 ProjFS 会落成实体明文，必须马上搬进密文库。
-            // 用文件监控（去抖 1.5 s）而不是轮询，符合“变化驱动”的资源约定。
+            // 与后台服务**共用同一份** attach_seal_watch（变化驱动，不全盘扫描）。
             let seal_area = std::sync::Arc::new(area);
-            let seal_handle = watch::start(
-                vec![root.clone()],
-                std::time::Duration::from_millis(1500),
-                {
-                    let seal_area = std::sync::Arc::clone(&seal_area);
-                    move |_path: std::path::PathBuf| {
-                        seal_area.seal_dirty();
-                    }
-                },
-            );
-            let _seal_handle = match seal_handle {
-                Ok(handle) => Some(handle),
-                Err(e) => {
-                    dhrust::warn!("安全区落盘加密监控未启动：{e}（保存后可能残留明文）");
-                    None
-                }
-            };
+            let _seal_handle = runtime::attach_seal_watch(&seal_area, &root);
             println!("安全区已启用：{}", root.display());
             println!("  密文库：{}", vault.display());
             println!("  在资源管理器打开该目录，看到的应是普通文件名（没有 .ogd）。");
