@@ -883,6 +883,7 @@ dependencies = [
 name = "pek-outguard-core"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "base64 0.22.1",
  "dhrust",

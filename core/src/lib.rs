@@ -20,6 +20,7 @@ pub mod machine;
 pub mod protocol;
 pub mod rules;
 pub mod signature;
+pub mod xts;
 
 pub use error::{Error, Result};
 
