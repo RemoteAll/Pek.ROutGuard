@@ -21,7 +21,7 @@ use dhrust::logs::LogLevel;
 use pek_outguard_client::api::Api;
 use pek_outguard_client::config::{self, ClientConfig};
 use pek_outguard_client::{
-    VERSION, assoc, base_dir, opensession, ops, projfs, runtime, safety, secure_area, service, state,
+    VERSION, assoc, base_dir, driver, opensession, ops, projfs, runtime, safety, secure_area, service, state,
 };
 use pek_outguard_core::machine;
 use pek_outguard_core::protocol::{HardwareInfo, HeartbeatRequest, RegisterRequest};
@@ -46,6 +46,7 @@ fn main() -> ExitCode {
         Some("sessions") => sessions_command(&base),
         Some("vault") => vault_command(&base, args.get(1..).unwrap_or(&[])),
         Some("secure-area") => secure_area_command(&base, args.get(1..).unwrap_or(&[])),
+        Some("driver") => driver_command(args.get(1..).unwrap_or(&[])),
         Some("mode") => mode_command(&base, args.get(1..).unwrap_or(&[])),
         Some("install") => install_command(&base),
         Some("uninstall") => {
@@ -93,6 +94,10 @@ fn print_help() {
          \x20 pek-outguard-client open <file>            受控打开（编辑保存后自动回写成密文）\n\
          \x20 pek-outguard-client sessions              列出受控打开会话\n\
          \x20 pek-outguard-client vault verify [--vault DIR]  密文库体检（逐个校验能否解密）\n\
+         \x20 pek-outguard-client driver status          内核驱动状态与统计（需先装驱动）\n\
+         \x20 pek-outguard-client driver rules --ext .docx,.xlsx [--path \"D:\\机密;C:\\图纸\"]\n\
+         \x20     \x20 下发受控规则（M1 只判定命中，仍不修改任何文件）\n\
+         \x20 pek-outguard-client driver reset|enable|disable  统计清零 / 启停判定\n\
          \x20 pek-outguard-client mode [show|live --confirm|dry-run]  运行模式（默认演练，不动文件）\n\
          \x20 pek-outguard-client register-assoc        注册 .ogd 关联（双击直接打开，免管理员）\n\
          \x20 pek-outguard-client unregister-assoc      解除 .ogd 关联\n\
@@ -807,6 +812,169 @@ fn vault_command(base: &Path, args: &[String]) -> u8 {
         println!("建议：① 立即停止对磁盘的写入；② 从备份恢复这些文件；");
         println!("      ③ 不要删除密文库——损坏的容器仍有取证/恢复价值。");
         1
+    }
+}
+
+/// 内核驱动控制通道：`status` 看状态与统计，`rules` 下发规则，`reset/enable/disable` 管理。
+fn driver_command(args: &[String]) -> u8 {
+    let action = args
+        .first()
+        .filter(|value| !value.starts_with("--"))
+        .map(String::as_str)
+        .unwrap_or("status");
+
+    let open = || match driver::DriverClient::open() {
+        Ok(client) => Ok(client),
+        Err(e) => {
+            eprintln!("{e}");
+            Err(())
+        }
+    };
+
+    match action {
+        "status" => {
+            let client = match open() {
+                Ok(client) => client,
+                Err(()) => return 1,
+            };
+            match client.version() {
+                Ok((major, minor)) => println!("驱动版本：{major}.{minor}"),
+                Err(e) => {
+                    eprintln!("读版本失败：{e}");
+                    return 1;
+                }
+            }
+            match client.stats() {
+                Ok(stats) => {
+                    println!("规则版本：{}", stats.rules_version);
+                    if stats.rules_version == 0 {
+                        println!("  规则未下发——驱动只计数，不会做任何加密判定");
+                    }
+                    println!(
+                        "  路径前缀 {} 条，扩展名 {} 条",
+                        stats.path_prefix_count, stats.ext_count
+                    );
+                    println!();
+                    println!("I/O 计数（M1 只观测，不改任何数据）：");
+                    println!("  Create={}  Read={}  Write={}", stats.create, stats.read, stats.write);
+                    println!("  SetInfo={}  Cleanup={}", stats.set_info, stats.cleanup);
+                    println!();
+                    println!("规则判定：");
+                    println!("  命中={}  未命中={}  取路径失败={}", stats.rule_hit, stats.rule_miss, stats.rule_eval_error);
+                    let last = stats.last_hit_display();
+                    if !last.is_empty() {
+                        println!("  最近命中：{last}");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("读统计失败：{e}");
+                    1
+                }
+            }
+        }
+
+        "rules" => {
+            let ext_arg = arg_value(args, "--ext").unwrap_or_default();
+            let path_arg = arg_value(args, "--path").unwrap_or_default();
+            if ext_arg.trim().is_empty() && path_arg.trim().is_empty() {
+                eprintln!("用法：driver rules --ext .docx,.xlsx [--path \"D:\\机密;E:\\图纸\"]");
+                eprintln!("说明：路径按 DOS 盘符给，客户端会自动换算成内核看到的 NT 路径");
+                return 2;
+            }
+            let mut prefixes = Vec::new();
+            for raw in path_arg.split([';', ',']).map(str::trim).filter(|s| !s.is_empty()) {
+                match driver::dos_to_nt_path(Path::new(raw)) {
+                    Ok(nt) => {
+                        println!("路径 {raw} → {nt}");
+                        prefixes.push(nt);
+                    }
+                    Err(e) => {
+                        eprintln!("路径换算失败：{e}");
+                        return 1;
+                    }
+                }
+            }
+            let mut exts = Vec::new();
+            for raw in ext_arg.split([',', ';']).map(str::trim).filter(|s| !s.is_empty()) {
+                let normalized = if raw.starts_with('.') {
+                    raw.to_lowercase()
+                } else {
+                    format!(".{}", raw.to_lowercase())
+                };
+                exts.push(normalized);
+            }
+            println!("扩展名：{}", exts.join(" "));
+
+            // 版本号用时间戳秒：天然单调递增，且能直接看出是哪次下发
+            let version = chrono::Local::now().timestamp() as u32;
+            let rules = match driver::DriverRules::new(version, &prefixes, &exts) {
+                Ok(rules) => rules,
+                Err(e) => {
+                    eprintln!("构造规则失败：{e}");
+                    return 1;
+                }
+            };
+            // 换算与构造都是纯计算，驱动没加载也能看到结果（便于先核对路径对不对）
+            let client = match open() {
+                Ok(client) => client,
+                Err(()) => {
+                    eprintln!("（以上换算结果供核对；驱动未加载，规则尚未下发）");
+                    return 1;
+                }
+            };
+            match client.set_rules(&rules) {
+                Ok(()) => {
+                    println!("规则已下发（版本 {version}）。驱动现在会判定命中，但**仍不修改任何文件**。");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("下发规则失败：{e}");
+                    1
+                }
+            }
+        }
+
+        "reset" => {
+            let client = match open() {
+                Ok(client) => client,
+                Err(()) => return 1,
+            };
+            match client.reset_stats() {
+                Ok(()) => {
+                    println!("统计已清零");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("清零失败：{e}");
+                    1
+                }
+            }
+        }
+
+        "enable" | "disable" => {
+            let client = match open() {
+                Ok(client) => client,
+                Err(()) => return 1,
+            };
+            let on = action == "enable";
+            match client.set_enabled(on) {
+                Ok(()) => {
+                    println!("驱动判定已{}", if on { "启用" } else { "停用" });
+                    0
+                }
+                Err(e) => {
+                    eprintln!("设置失败：{e}");
+                    1
+                }
+            }
+        }
+
+        other => {
+            eprintln!("未知的 driver 子命令：{other}");
+            eprintln!("用法：driver [status|rules|reset|enable|disable]");
+            2
+        }
     }
 }
 

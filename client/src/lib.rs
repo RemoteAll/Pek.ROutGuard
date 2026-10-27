@@ -9,6 +9,7 @@
 pub mod api;
 pub mod assoc;
 pub mod config;
+pub mod driver;
 pub mod opensession;
 pub mod ops;
 pub mod projfs;
