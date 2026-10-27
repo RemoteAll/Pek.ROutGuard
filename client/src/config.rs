@@ -53,6 +53,11 @@ pub struct ClientSection {
     /// 是否允许把「桌面/文档/下载/盘符根/系统目录」这类危险目录作为监控根。
     /// 默认 `false`：这些目录会被直接跳过并告警，避免误加密整个用户资料。
     pub allow_risky_roots: bool,
+    /// 安全区（透明加密目录）：列表里的目录会被映射成「普通文件名」视图，
+    /// 用户在里面直接打开/保存，磁盘上只存密文（ProjFS 实现）。
+    ///
+    /// 要求：目录已存在且为空（历史文件用 `secure-area import` 导入）。
+    pub secure_areas: Vec<String>,
 }
 
 impl ClientSection {
@@ -75,6 +80,7 @@ impl Default for ClientSection {
             mode: "dry_run".to_string(),
             recovery_keep_days: 7,
             allow_risky_roots: false,
+            secure_areas: Vec::new(),
         }
     }
 }

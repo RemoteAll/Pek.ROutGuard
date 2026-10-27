@@ -82,7 +82,8 @@ fn print_help() {
          \x20 pek-outguard-client status                 查看配置与同步状态\n\
          \x20 pek-outguard-client config show            显示当前配置\n\
          \x20 pek-outguard-client config set --server http://10.0.0.5:5600 \\\n\
-         \x20     [--enroll CODE] [--account USER] [--password PASS] [--temp DIR]\n\
+         \x20     [--enroll CODE] [--account USER] [--password PASS] [--temp DIR] \\\n\
+         \x20     [--secure-areas D:\\SecureWork;E:\\Secure2] [--recovery-days 7]\n\
          \x20 pek-outguard-client register               注册终端（设备模式/账号模式）\n\
          \x20 pek-outguard-client sync                   拉取策略与密钥\n\
          \x20 pek-outguard-client heartbeat              发送一次心跳\n\
@@ -175,6 +176,19 @@ fn status_command(base: &Path) -> u8 {
         }
     );
     println!("原文件回收保留：{} 天", section.recovery_keep_days);
+    println!(
+        "安全区（透明加密）：{}",
+        if section.secure_areas.is_empty() {
+            "未配置（用 config set --secure-areas 添加）".to_string()
+        } else {
+            format!(
+                "{} 个｜{}｜ProjFS {}",
+                section.secure_areas.len(),
+                section.secure_areas.join("；"),
+                if projfs::is_supported() { "可用" } else { "不支持" }
+            )
+        }
+    );
 
     // 离线状态：本地缓存策略照常生效，超宽限才拒绝解密。
     let now = chrono::Utc::now().timestamp();
@@ -296,6 +310,7 @@ fn config_command(base: &Path, args: &[String]) -> u8 {
                 }
             );
             println!("TempDir = \"{}\"", section.temp_dir);
+            println!("SecureAreas = {:?}", section.secure_areas);
             println!("WatchRoots = {:?}", section.watch_roots);
             println!("ReportIntervalSecs = {}", section.report_interval_secs);
             0
@@ -320,6 +335,17 @@ fn config_set(base: &Path, args: &[String]) -> u8 {
             "--account" => section.account = value.trim().to_string(),
             "--password" => section.password = config::encrypt_password(&value),
             "--temp" => section.temp_dir = value.trim().to_string(),
+            // 安全区目录，多个用分号分隔：`--secure-areas "D:\SecureWork;E:\Secure2"`
+            "--secure-areas" => {
+                section.secure_areas = value
+                    .split(';')
+                    .map(|item| item.trim().to_string())
+                    .filter(|item| !item.is_empty())
+                    .collect();
+            }
+            "--recovery-days" => {
+                section.recovery_keep_days = value.trim().parse().unwrap_or(7);
+            }
             other => {
                 eprintln!("未知参数：{other}");
                 return 2;
@@ -769,6 +795,7 @@ fn secure_area_command(base: &Path, args: &[String]) -> u8 {
                         .as_ref()
                         .map(|b| b.classification.clone())
                         .unwrap_or_default(),
+                    audit: None,
                 },
                 resolver,
             ) {
@@ -809,10 +836,85 @@ fn secure_area_command(base: &Path, args: &[String]) -> u8 {
             }
             0
         }
+        Some("import") => {
+            let Some(root) = root_arg else {
+                eprintln!("用法：secure-area import --root <安全区> --file <源文件> [--as 相对路径] [--move]");
+                return 2;
+            };
+            let Some(file) = arg_value(args, "--file") else {
+                eprintln!("缺少 --file <源文件>");
+                return 2;
+            };
+            let root = PathBuf::from(root);
+            let source = PathBuf::from(&file);
+            let state = state::load(base);
+            if state.policy.is_none() {
+                eprintln!("尚未同步策略（先执行 sync）");
+                return 1;
+            }
+            let name = root
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| "secure".to_string());
+            let vault = arg_value(args, "--vault")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| base.join("Data").join("Vault").join(&name));
+            let relative = arg_value(args, "--as").unwrap_or_else(|| {
+                source
+                    .file_name()
+                    .map(|value| value.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unnamed".to_string())
+            });
+            let bundle = state.policy.clone();
+            let policy_id = bundle
+                .as_ref()
+                .and_then(|b| b.policy_sets.first().map(|policy| policy.id.clone()))
+                .unwrap_or_else(|| "default".to_string());
+            let options = secure_area::SecureAreaOptions {
+                root: root.clone(),
+                vault: vault.clone(),
+                cache: base.join("Data").join("VaultCache").join(&name),
+                policy_id: policy_id.clone(),
+                company: bundle.as_ref().map(|b| b.company.clone()).unwrap_or_default(),
+                notice: bundle.as_ref().map(|b| b.notice.clone()).unwrap_or_default(),
+                classification: bundle
+                    .as_ref()
+                    .map(|b| b.classification.clone())
+                    .unwrap_or_default(),
+                audit: None,
+            };
+            let key = match ops::policy_key(&state, &policy_id) {
+                Ok(key) => key,
+                Err(e) => {
+                    eprintln!("取策略密钥失败：{e}");
+                    return 1;
+                }
+            };
+            let keep = !args.iter().any(|arg| arg == "--move");
+            match secure_area::import_file(&options, &key, &source, &relative, keep) {
+                Ok(vault_path) => {
+                    println!("已导入：{} → {}", source.display(), vault_path.display());
+                    println!(
+                        "安全区 {} 里现在应该能直接看到 {}（重启 secure-area run 或刷新资源管理器）。",
+                        root.display(),
+                        relative
+                    );
+                    if keep {
+                        println!("源文件保留；如确认无误可自行删除（或用 --move 让客户端删）。");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("导入失败：{e}");
+                    1
+                }
+            }
+        }
         _ => {
-            eprintln!("用法：secure-area [status|run] --root <目录> [--vault <密文库>]");
+            eprintln!("用法：secure-area [status|run|import] --root <目录> [--vault <密文库>]");
             eprintln!("  status 检查系统支持与目录是否可启用");
             eprintln!("  run    前台运行安全区（调试用；正式由客户端服务托管）");
+            eprintln!("  import --file <源文件> [--as 相对路径] [--move]  把明文加密进密文库");
             2
         }
     }

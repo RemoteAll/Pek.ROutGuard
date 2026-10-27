@@ -1,4 +1,4 @@
-//! 客户端运行时：注册 → 同步策略 → 监控自动加密 → 心跳 / 事件上报。
+﻿//! 客户端运行时：注册 → 同步策略 → 监控自动加密 → 心跳 / 事件上报。
 //!
 //! 周期口径（资源约定）：主循环 30 s（事件上报每轮、心跳每 60 s），
 //! 监控只盯策略下发的 `watch_roots`，去抖 800 ms，无周期全盘扫描。
@@ -19,7 +19,7 @@ use crate::api::Api;
 use crate::config::{self, ClientSection};
 use crate::state::{self, ClientState};
 use crate::watch::{self, WatchHandle};
-use crate::{VERSION, opensession, ops, safety};
+use crate::{VERSION, opensession, ops, safety, secure_area};
 
 /// 停止标志（服务 Stop/Shutdown 或 Ctrl+C 置位）。
 pub static STOP: AtomicBool = AtomicBool::new(false);
@@ -76,6 +76,9 @@ pub fn run(base: &Path) -> Result<(), String> {
     // 这是“打开→编辑→保存”闭环的关键：没有它，用户的修改只落在临时明文上。
     let temp_dir = config::temp_dir(&section);
     let _session_watch = start_session_watch(base, &temp_dir, Arc::clone(&shared));
+
+    // 安全区（透明加密目录）：虚拟根里用户看到普通文件名，磁盘上只存密文。
+    let _secure_areas = start_secure_areas(base, &section, Arc::clone(&shared));
 
     let mut tick: u32 = 0;
     while !STOP.load(Ordering::SeqCst) {
@@ -548,6 +551,143 @@ fn start_watch(
         handle_change(&base, &handler_shared, &path, &encrypt);
     })?;
     Ok(Some(handle))
+}
+
+/// 启动配置里的全部安全区（透明加密目录）。返回句柄，drop 即全部停止。
+fn start_secure_areas(
+    base: &Path,
+    section: &ClientSection,
+    shared: Arc<Mutex<ClientState>>,
+) -> Vec<(Arc<secure_area::SecureArea>, Option<WatchHandle>)> {
+    let mut running = Vec::new();
+    if section.secure_areas.is_empty() {
+        return running;
+    }
+    if !crate::projfs::is_supported() {
+        dhrust::warn!(
+            "配置了安全区但系统不支持 ProjFS（需 Windows 10 1809+ / Server 2019+），已跳过"
+        );
+        return running;
+    }
+
+    for root_text in &section.secure_areas {
+        let root_text = root_text.trim();
+        if root_text.is_empty() {
+            continue;
+        }
+        let root = PathBuf::from(root_text);
+        // 安全阀：危险目录不允许当安全区（和监控根同一套判定）。
+        if !section.allow_risky_roots
+            && let Some(reason) = safety::risky_root_reason(&root)
+        {
+            dhrust::warn!("跳过危险的安全区 {root_text}：{reason}");
+            continue;
+        }
+        if !root.is_dir() {
+            dhrust::warn!("安全区目录不存在（请先创建）：{root_text}");
+            continue;
+        }
+
+        let name = root
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| "secure".to_string());
+        let bundle = shared.lock().ok().and_then(|state| state.policy.clone());
+        let (Some(bundle), Ok(key)) = (
+            bundle,
+            shared
+                .lock()
+                .ok()
+                .and_then(|state| {
+                    let policy_id = state
+                        .policy
+                        .as_ref()
+                        .and_then(|b| b.policy_sets.first().map(|p| p.id.clone()))
+                        .unwrap_or_else(|| "default".to_string());
+                    ops::policy_key(&state, &policy_id).ok()
+                })
+                .ok_or("策略密钥不可用"),
+        ) else {
+            dhrust::warn!("安全区 {root_text} 未启用：策略尚未就绪（联网同步后重启服务生效）");
+            continue;
+        };
+
+        let options = secure_area::SecureAreaOptions {
+            root: root.clone(),
+            vault: base.join("Data").join("Vault").join(&name),
+            cache: base.join("Data").join("VaultCache").join(&name),
+            policy_id: bundle
+                .policy_sets
+                .first()
+                .map(|policy| policy.id.clone())
+                .unwrap_or_else(|| "default".to_string()),
+            company: bundle.company.clone(),
+            notice: bundle.notice.clone(),
+            classification: bundle.classification.clone(),
+            audit: Some(Arc::new({
+                let shared = Arc::clone(&shared);
+                let root_name = name.clone();
+                move |action: &'static str, relative: &str, size: Option<u64>| {
+                    let event_type = match action {
+                        // 保存回写与导入都属于"文件被加密落盘"。
+                        "seal" | "import" => EventType::Encrypt,
+                        _ => EventType::Open,
+                    };
+                    let detail = format!("安全区 {root_name}：{action}");
+                    let path = format!("{}\\{relative}", root_name);
+                    let event = ClientEvent {
+                        event_id: dhrust::random::hex(8),
+                        event_type,
+                        occurred_at: chrono::Utc::now().timestamp_millis(),
+                        path: Some(path),
+                        rule_id: None,
+                        user: Some(dhrust::sys::machine::user_name()),
+                        process_name: None,
+                        size,
+                        detail: Some(detail),
+                    };
+                    push_event(&shared, event);
+                }
+            })),
+        };
+
+        // 目录里若有残留明文（上次异常退出/用户手工拷入），先吸收进密文库。
+        if let Err(e) = secure_area::absorb_existing(&options, &key) {
+            dhrust::warn!("安全区 {root_text} 残留清理失败：{e}");
+        }
+
+        let area = match secure_area::start(options, {
+            let shared = Arc::clone(&shared);
+            Arc::new(move |policy_id: &str| {
+                shared
+                    .lock()
+                    .ok()
+                    .and_then(|state| ops::policy_key(&state, policy_id).ok())
+            })
+        }) {
+            Ok(area) => Arc::new(area),
+            Err(e) => {
+                dhrust::warn!("安全区 {root_text} 启动失败：{e}");
+                continue;
+            }
+        };
+
+        // 保存后落盘加密：ProjFS 会先落成实体明文，这里立刻搬进密文库。
+        let seal_area = Arc::clone(&area);
+        let seal_watch = watch::start(
+            vec![root.clone()],
+            Duration::from_millis(1500),
+            move |_path: PathBuf| {
+                seal_area.seal_dirty();
+            },
+        )
+        .map_err(|e| dhrust::warn!("安全区 {root_text} 落盘加密监控未启动：{e}"))
+        .ok();
+
+        dhrust::info!("安全区已就绪（透明加密）：{root_text}");
+        running.push((area, seal_watch));
+    }
+    running
 }
 
 /// 启动受控打开回写监控：临时目录内的明文改动 → 重新加密回 `.ogd`。

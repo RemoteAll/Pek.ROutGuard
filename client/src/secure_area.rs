@@ -116,6 +116,11 @@ unsafe extern "system" {
 /// 按容器头里的 `policyId` 解析策略密钥。
 pub type KeyResolver = dyn Fn(&str) -> Option<[u8; 32]> + Send + Sync;
 
+/// 安全区审计回调：`(动作, 相对路径, 大小)`。
+///
+/// 动作：`"open"`（用户打开读） / `"seal"`（保存后重新加密） / `"import"`（导入）。
+pub type AuditSink = dyn Fn(&'static str, &str, Option<u64>) + Send + Sync;
+
 /// 安全区启动参数。
 #[derive(Clone)]
 pub struct SecureAreaOptions {
@@ -133,6 +138,8 @@ pub struct SecureAreaOptions {
     pub notice: String,
     /// 密级
     pub classification: String,
+    /// 审计回调（可选）
+    pub audit: Option<Arc<AuditSink>>,
 }
 
 /// 运行中的安全区（drop 即停止虚拟化）。
@@ -195,10 +202,24 @@ impl SecureArea {
         let key = (inner.key)(&self.options.policy_id)
             .ok_or_else(|| format!("策略密钥不可用（policyId={}）", self.options.policy_id))?;
         let plain = std::fs::read(path).map_err(|e| format!("读取实体文件失败：{e}"))?;
+        let plain_hash = pek_outguard_core::crypto::sha256(&plain);
         let name = path
             .file_name()
             .map(|value| value.to_string_lossy().to_string())
             .unwrap_or_default();
+
+        // ProjFS 的 placeholder 状态变化也会触发 Modify，导致同内容反复"落盘加密"。
+        // 内容没变时只把实体降级回占位符（必须做，否则磁盘留明文），但不重复加密、不记审计。
+        let unchanged = inner
+            .sealed
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&relative).copied())
+            == Some(plain_hash);
+        if unchanged {
+            demote_to_placeholder(self.context, &relative, path, plain.len() as i64)?;
+            return Ok(());
+        }
 
         let header = pek_outguard_core::container::Header {
             company: self.options.company.clone(),
@@ -237,43 +258,64 @@ impl SecureArea {
 
         // ② 让 ProjFS 把这个“实体明文文件”抷回占位符（按 flags 允许丢弃本地数据）。
         //    注意：不能先删再 PrjWritePlaceholderInfo——ProjFS 的目录缓存会把它当成已删除。
-        let info = placeholder_info(plain.len() as i64);
-        let name_wide = wide(&relative);
-        let mut cause: i32 = 0;
-        let hr = unsafe {
-            PrjUpdateFileIfNeeded(
-                self.context,
-                name_wide.as_ptr(),
-                &info,
-                std::mem::size_of::<PRJ_PLACEHOLDER_INFO>() as u32,
-                UPDATE_ALLOW_DIRTY_DATA | UPDATE_ALLOW_DIRTY_METADATA,
-                &mut cause,
-            )
-        };
-        if hr < 0 {
-            // 兜底：删实体再重建占位符（部分系统版本对 Update 支持不全）。
-            std::fs::remove_file(path).map_err(|e| format!("删除实体明文失败：{e}"))?;
-            let hr2 = unsafe {
-                PrjWritePlaceholderInfo(
-                    self.context,
-                    name_wide.as_ptr(),
-                    &info,
-                    std::mem::size_of::<PRJ_PLACEHOLDER_INFO>() as u32,
-                )
-            };
-            if hr2 < 0 {
-                return Err(format!(
-                    "恢复占位符失败（Update 0x{:08X}/cause {cause}，Write 0x{:08X}）",
-                    hr as u32, hr2 as u32
-                ));
-            }
-        }
+        demote_to_placeholder(self.context, &relative, path, plain.len() as i64)?;
         // 容器变了 → 缓存失效
         if let Ok(mut cache) = inner.cache.lock() {
             cache.remove(&relative);
         }
+        if let Ok(mut sealed) = inner.sealed.lock() {
+            if sealed.len() > 4000 {
+                sealed.clear();
+            }
+            sealed.insert(relative.clone(), plain_hash);
+        }
+        if let Some(sink) = &self.options.audit {
+            (sink)("seal", &relative, Some(plain.len() as u64));
+        }
         Ok(())
     }
+}
+
+/// 把"被写脏的实体文件"降级回占位符（丢弃本地明文数据）。
+fn demote_to_placeholder(
+    context: PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT,
+    relative: &str,
+    full_path: &Path,
+    size: i64,
+) -> Result<(), String> {
+    let info = placeholder_for(false, size);
+    let name_wide = wide(relative);
+    let mut cause: i32 = 0;
+    let hr = unsafe {
+        PrjUpdateFileIfNeeded(
+            context,
+            name_wide.as_ptr(),
+            &info,
+            std::mem::size_of::<PRJ_PLACEHOLDER_INFO>() as u32,
+            UPDATE_ALLOW_DIRTY_DATA | UPDATE_ALLOW_DIRTY_METADATA,
+            &mut cause,
+        )
+    };
+    if hr >= 0 {
+        return Ok(());
+    }
+    // 兜底：删实体再重建占位符（部分系统版本对 Update 支持不全）。
+    std::fs::remove_file(full_path).map_err(|e| format!("删除实体明文失败：{e}"))?;
+    let hr2 = unsafe {
+        PrjWritePlaceholderInfo(
+            context,
+            name_wide.as_ptr(),
+            &info,
+            std::mem::size_of::<PRJ_PLACEHOLDER_INFO>() as u32,
+        )
+    };
+    if hr2 < 0 {
+        return Err(format!(
+            "恢复占位符失败（Update 0x{:08X}/cause {cause}，Write 0x{:08X}）",
+            hr as u32, hr2 as u32
+        ));
+    }
+    Ok(())
 }
 
 /// ProjFS 占位符带"数据按需召回"属性；实体文件没有。
@@ -299,10 +341,14 @@ impl Drop for SecureArea {
 struct Inner {
     options: SecureAreaOptions,
     key: Arc<KeyResolver>,
-    /// 枚举会话：枚举 GUID → 待派发的文件列表
-    enumerations: Mutex<HashMap<String, Vec<String>>>,
+    /// 枚举会话：枚举 GUID → 待派发的条目列表
+    enumerations: Mutex<HashMap<String, Vec<Entry>>>,
     /// 解密缓存：相对路径 → 明文内容（容器 mtime 变化就重建）
     cache: Mutex<HashMap<String, Arc<CachedPlain>>>,
+    /// 打开审计去重：相对路径 → 最近一次记录时间（同一文件 5 分钟内只记一条）
+    opened: Mutex<HashMap<String, std::time::Instant>>,
+    /// 上次落盘加密时的明文 SHA-256：内容没变就不重复加密（ProjFS 会反复触发 Modify）
+    sealed: Mutex<HashMap<String, [u8; 32]>>,
 }
 
 struct CachedPlain {
@@ -311,12 +357,30 @@ struct CachedPlain {
     data: Vec<u8>,
 }
 
+/// 目录枚举项。
+#[derive(Clone)]
+struct Entry {
+    /// 虚拟相对路径（如 `采购部\2026年度合同.txt`）
+    relative: String,
+    /// 是否是子目录
+    is_dir: bool,
+}
+
 impl Inner {
     /// 虚拟相对路径（如 `采购合同.docx`）→ 密文库真实路径。
     fn vault_path(&self, relative: &str) -> PathBuf {
         self.options
             .vault
             .join(format!("{relative}.{VAULT_EXT}"))
+    }
+
+    /// 只读容器头取明文大小（枚举用；**不解密全文**，大目录不会卡）。
+    fn file_size(&self, relative: &str) -> Option<i64> {
+        let mut reader = std::io::BufReader::new(
+            std::fs::File::open(self.vault_path(relative)).ok()?,
+        );
+        let header = pek_outguard_core::container::read_header(&mut reader).ok()?;
+        Some(header.original_size as i64)
     }
 
     /// 取明文（带缓存）。
@@ -353,30 +417,73 @@ impl Inner {
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(relative.to_string(), Arc::clone(&entry));
         }
+        // 审计：同一文件 5 分钟内只记一条（避免流式读触发几十条重复事件）。
+        self.audit_open(relative, entry.data.len() as u64);
         Some(entry)
     }
 
-    /// 枚举密文库某目录下的文件（返回虚拟相对路径）。
-    fn list(&self, relative_dir: &str) -> Vec<String> {
-        let dir = if relative_dir.is_empty() {
+    fn audit_open(&self, relative: &str, size: u64) {
+        let Some(sink) = &self.options.audit else {
+            return;
+        };
+        let Ok(mut opened) = self.opened.lock() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if let Some(last) = opened.get(relative)
+            && now.duration_since(*last).as_secs() < 300
+        {
+            return;
+        }
+        // 表有界：超过 2000 条直接清空（只需近期去重，不持久）。
+        if opened.len() > 2000 {
+            opened.clear();
+        }
+        opened.insert(relative.to_string(), now);
+        drop(opened);
+        (sink)("open", relative, Some(size));
+    }
+
+    /// 密文库内某个相对目录的真实路径（用于判断是不是目录）。
+    fn vault_dir(&self, relative: &str) -> PathBuf {
+        if relative.is_empty() {
             self.options.vault.clone()
         } else {
-            self.options.vault.join(relative_dir)
-        };
+            self.options.vault.join(relative)
+        }
+    }
+
+    /// 枚举密文库某目录下的文件与子目录（返回虚拟相对路径）。
+    fn list(&self, relative_dir: &str) -> Vec<Entry> {
+        let dir = self.vault_dir(relative_dir);
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return Vec::new();
         };
         let mut out = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            let Some(stem) = name.strip_suffix(&format!(".{VAULT_EXT}")) else {
+            // 跳过内部文件（`.instance-id` 等）。
+            if name.starts_with('.') {
                 continue;
+            }
+            let join = |child: &str| {
+                if relative_dir.is_empty() {
+                    child.to_string()
+                } else {
+                    format!("{relative_dir}\\{child}")
+                }
             };
-            out.push(if relative_dir.is_empty() {
-                stem.to_string()
-            } else {
-                format!("{relative_dir}\\{stem}")
-            });
+            if entry.path().is_dir() {
+                out.push(Entry {
+                    relative: join(&name),
+                    is_dir: true,
+                });
+            } else if let Some(stem) = name.strip_suffix(&format!(".{VAULT_EXT}")) {
+                out.push(Entry {
+                    relative: join(stem),
+                    is_dir: false,
+                });
+            }
         }
         out
     }
@@ -409,6 +516,8 @@ pub fn start(options: SecureAreaOptions, key: Arc<KeyResolver>) -> Result<Secure
         key,
         enumerations: Mutex::new(HashMap::new()),
         cache: Mutex::new(HashMap::new()),
+        opened: Mutex::new(HashMap::new()),
+        sealed: Mutex::new(HashMap::new()),
     }));
 
     let callbacks = PRJ_CALLBACKS {
@@ -543,16 +652,20 @@ unsafe extern "system" fn cb_get_enum(
 
     while let Some(entry) = entries.first().cloned() {
         entries.remove(0);
-        let name = Path::new(&entry)
+        let name = Path::new(&entry.relative)
             .file_name()
             .map(|value| value.to_string_lossy().to_string())
-            .unwrap_or_else(|| entry.clone());
+            .unwrap_or_else(|| entry.relative.clone());
         // 通配匹配（`*` 即可；不实现完整的 DOS 通配以免复杂化）。
         if !search.is_empty() && search != "*" && !dhrust::io::wildcard_match(&name, &search) {
             continue;
         }
-        let size = inner.plain(&entry).map(|plain| plain.data.len() as i64).unwrap_or(0);
-        let info = basic_info(size, None);
+        let info = if entry.is_dir {
+            dir_basic_info()
+        } else {
+            let size = inner.file_size(&entry.relative).unwrap_or(0);
+            basic_info(size, None)
+        };
         let name_wide = wide(&name);
         let hr = unsafe { PrjFillDirEntryBuffer(name_wide.as_ptr(), &info, buffer) };
         if hr < 0 {
@@ -573,11 +686,26 @@ unsafe extern "system" fn cb_placeholder(data: *const PRJ_CALLBACK_DATA) -> i32 
         // 根目录本身不需要占位信息。
         return S_OK;
     }
-    let Some(plain) = inner.plain(&path) else {
+
+    // 子目录：密文库里有同名目录就当成目录占位符。
+    if inner.vault_dir(&path).is_dir() {
+        let placeholder = placeholder_for(true, 0);
+        let name_wide = wide(&path);
+        let hr = unsafe {
+            PrjWritePlaceholderInfo(
+                (*data).NamespaceVirtualizationContext,
+                name_wide.as_ptr(),
+                &placeholder,
+                std::mem::size_of::<PRJ_PLACEHOLDER_INFO>() as u32,
+            )
+        };
+        return if hr < 0 { hr } else { S_OK };
+    }
+
+    let Some(size) = inner.file_size(&path) else {
         return HR_FILE_NOT_FOUND;
     };
-    let size = plain.data.len() as i64;
-    let placeholder = placeholder_info(size);
+    let placeholder = placeholder_for(false, size);
     let name_wide = wide(&path);
     let hr = unsafe {
         PrjWritePlaceholderInfo(
@@ -727,9 +855,26 @@ fn basic_info(size: i64, timestamp: Option<i64>) -> PRJ_FILE_BASIC_INFO {
     }
 }
 
-fn placeholder_info(size: i64) -> PRJ_PLACEHOLDER_INFO {
+fn dir_basic_info() -> PRJ_FILE_BASIC_INFO {
+    PRJ_FILE_BASIC_INFO {
+        IsDirectory: 1,
+        FileSize: 0,
+        CreationTime: 0,
+        LastAccessTime: 0,
+        LastWriteTime: 0,
+        ChangeTime: 0,
+        // FILE_ATTRIBUTE_DIRECTORY
+        FileAttributes: 0x10,
+    }
+}
+
+fn placeholder_for(is_dir: bool, size: i64) -> PRJ_PLACEHOLDER_INFO {
     PRJ_PLACEHOLDER_INFO {
-        FileBasicInfo: basic_info(size, None),
+        FileBasicInfo: if is_dir {
+            dir_basic_info()
+        } else {
+            basic_info(size, None)
+        },
         EaInformation: windows_sys::Win32::Storage::ProjectedFileSystem::PRJ_PLACEHOLDER_INFO_0 {
             EaBufferSize: 0,
             OffsetToFirstEa: 0,
@@ -750,6 +895,127 @@ fn placeholder_info(size: i64) -> PRJ_PLACEHOLDER_INFO {
         },
         VariableData: [0u8; 1],
     }
+}
+
+/// 启动前"吸收"目录里残留的**明文实体文件**（上次异常退出、或用户手工拷进去的）：
+/// 加密进密文库并删除，保证目录为空才能启动 ProjFS。返回吸收的文件数。
+pub fn absorb_existing(options: &SecureAreaOptions, key: &[u8; 32]) -> Result<usize, String> {
+    if !options.root.is_dir() {
+        return Ok(0);
+    }
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    let mut stack = vec![options.root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(path.clone());
+                dirs.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+
+    let mut absorbed = 0usize;
+    for path in files {
+        let relative = path
+            .strip_prefix(&options.root)
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if relative.is_empty() {
+            continue;
+        }
+        match import_file(options, key, &path, &relative, false) {
+            Ok(_) => absorbed += 1,
+            Err(e) => dhrust::warn!("吸收残留明文失败（{}）：{e}", path.display()),
+        }
+    }
+    // 清掉空子目录（ProjFS 要求根目录为空）
+    for dir in dirs.into_iter().rev() {
+        let _ = std::fs::remove_dir(&dir);
+    }
+    if absorbed > 0 {
+        dhrust::info!("安全区启动前吸收了 {absorbed} 个残留明文文件（已加密进密文库）");
+    }
+    Ok(absorbed)
+}
+
+/// 导入一个明文文件到密文库（安全区里**立刻**就能看到它，磁盘上只存密文）。
+///
+/// 这是"把已有文档搬进安全区"的入口：原文件按 `keep_source` 决定保留还是删除。
+pub fn import_file(
+    options: &SecureAreaOptions,
+    key: &[u8; 32],
+    source: &Path,
+    relative: &str,
+    keep_source: bool,
+) -> Result<PathBuf, String> {
+    if !source.is_file() {
+        return Err(format!("源文件不存在：{}", source.display()));
+    }
+    if relative.trim().is_empty() {
+        return Err("目标相对路径不能为空".into());
+    }
+    let plain = std::fs::read(source).map_err(|e| format!("读取源文件失败：{e}"))?;
+    let name = Path::new(relative)
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| relative.to_string());
+
+    let header = pek_outguard_core::container::Header {
+        company: options.company.clone(),
+        notice: options.notice.clone(),
+        classification: options.classification.clone(),
+        policy_id: options.policy_id.clone(),
+        policy_version: 0,
+        rule_id: String::new(),
+        creator: dhrust::sys::machine::user_name(),
+        client_id: String::new(),
+        created_at: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+        original_name: name,
+        original_size: plain.len() as u64,
+        plain_sha256: Some(pek_outguard_core::crypto::hex(
+            &pek_outguard_core::crypto::sha256(&plain),
+        )),
+    };
+
+    let vault_path = options
+        .vault
+        .join(format!("{}.{VAULT_EXT}", relative.replace('/', "\\")));
+    if let Some(parent) = vault_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建密文库目录失败：{e}"))?;
+    }
+    let temp = vault_path.with_extension(format!("{VAULT_EXT}.tmp"));
+    {
+        let mut input = std::io::Cursor::new(&plain);
+        let mut out = std::fs::File::create(&temp)
+            .map_err(|e| format!("创建密文失败（{}）：{e}", temp.display()))?;
+        pek_outguard_core::container::encrypt_stream(key, &header, &mut input, &mut out)
+            .map_err(|e| format!("加密失败：{e}"))?;
+    }
+    std::fs::rename(&temp, &vault_path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("落位密文失败：{e}")
+    })?;
+
+    if !keep_source
+        && let Err(e) = std::fs::remove_file(source)
+    {
+        dhrust::warn!(
+            "导入成功但删除源文件失败（{}）：{e}（请手动清理）",
+            source.display()
+        );
+    }
+    if let Some(sink) = &options.audit {
+        (sink)("import", relative, Some(plain.len() as u64));
+    }
+    Ok(vault_path)
 }
 
 /// 安全区是否可用（系统支持 ProjFS 且目录为空）。
@@ -803,10 +1069,13 @@ mod tests {
                 company: "示例".into(),
                 notice: "内部".into(),
                 classification: "内部".into(),
+                audit: None,
             },
             key: Arc::new(|_| Some([0u8; 32])),
             enumerations: Mutex::new(HashMap::new()),
             cache: Mutex::new(HashMap::new()),
+            opened: Mutex::new(HashMap::new()),
+            sealed: Mutex::new(HashMap::new()),
         };
         let path = inner.vault_path("sub\\采购合同.docx");
         assert!(path.to_string_lossy().ends_with("采购合同.docx.ogd"));
