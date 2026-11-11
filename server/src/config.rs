@@ -101,14 +101,8 @@ pub fn verify_password(stored: &str, password: &str) -> bool {
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    // 实现已下沉到公共库（Pek.Proxy / Pek.RDbProxy 均有同款）
+    dhrust::text::constant_time_eq(a, b)
 }
 
 #[cfg(test)]
