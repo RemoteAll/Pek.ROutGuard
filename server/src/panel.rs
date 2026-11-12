@@ -336,6 +336,7 @@ fn ok(data: Value) -> HttpResponse {
     HttpResponse::json(200, json!({ "ok": true, "data": data }).to_string())
 }
 
+/// 失败信封：`{"ok":false,"message":…}`（实现已下沉 `dhrust::net::http::HttpResponse::json_error`）。
 fn fail(status: u16, message: &str) -> HttpResponse {
-    HttpResponse::json(status, json!({ "ok": false, "message": message }).to_string())
+    HttpResponse::json_error(status, message)
 }
